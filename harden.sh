@@ -265,6 +265,7 @@ ClientAliveInterval 300
 ClientAliveCountMax 2
 EOF
 
+  mkdir -p /run/sshd
   if ! sshd -t; then
     error "sshd config test failed — restoring backup."
     [[ -f "$backup" ]] && cp -a "$backup" "$dropin" || rm -f "$dropin"
