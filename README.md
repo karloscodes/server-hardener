@@ -5,15 +5,7 @@ Interactive wizard to harden Ubuntu VPS boxes. Tailscale-first.
 ## Quick Start
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/karloscodes/server-hardener/main/harden.sh | sudo bash
-```
-
-Or download first and review:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/karloscodes/server-hardener/main/harden.sh -o harden.sh
-cat harden.sh  # review it
-sudo bash harden.sh
+curl -fsSL https://raw.githubusercontent.com/karloscodes/server-hardener/main/harden.sh -o /tmp/harden.sh && sudo bash /tmp/harden.sh
 ```
 
 ## What it does
