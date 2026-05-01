@@ -19,6 +19,12 @@ The wizard asks 4 questions, shows a summary of changes, and asks for confirmati
 - No Fail2ban needed (nobody can reach SSH)
 - UFW opens only 80/443 publicly
 
+### Cloudflare-only mode (optional, on top of either mode above)
+
+- Restricts public TCP ports (80/443 by default) to Cloudflare's published IP ranges
+- Direct IP scans see filtered ports; only requests proxied through Cloudflare reach the box
+- Re-run the wizard when Cloudflare adds ranges (rare, but it happens)
+
 ### No-Tailscale mode
 
 - Moves SSH to a custom port (default 2222)
@@ -42,6 +48,7 @@ The wizard asks 4 questions, shows a summary of changes, and asks for confirmati
 | Tailscale auth key | empty | Optional — generate at [Tailscale admin](https://login.tailscale.com/admin/settings/keys) |
 | SSH port | 2222 | Only asked if Tailscale is disabled |
 | TCP ports to open | 80 443 | Public-facing ports |
+| Restrict to Cloudflare IPs? | no | Locks the open ports to Cloudflare's IP ranges only |
 
 ## Requirements
 

@@ -91,6 +91,12 @@ run_wizard() {
   fi
 
   OPEN_PORTS="$(ask "TCP ports to open publicly" "80 443")"
+
+  if ask_yn "Restrict public TCP ports to Cloudflare IPs only?" "n"; then
+    CLOUDFLARE_ONLY="yes"
+  else
+    CLOUDFLARE_ONLY="no"
+  fi
 }
 
 # --- Summary ------------------------------------------------------------------
@@ -110,7 +116,11 @@ show_summary() {
     info "SSH access:          Public (protected by Fail2ban)"
     info "Tailscale:           no"
   fi
-  info "Public TCP ports:    ${OPEN_PORTS}"
+  if [[ "$CLOUDFLARE_ONLY" == "yes" ]]; then
+    info "Public TCP ports:    ${OPEN_PORTS} (restricted to Cloudflare IP ranges)"
+  else
+    info "Public TCP ports:    ${OPEN_PORTS} (open to the internet)"
+  fi
   info "Firewall:            UFW (deny incoming, allow outgoing)"
   info "Unattended upgrades: enabled (auto-reboot 03:30)"
   info "Sysctl hardening:    enabled"
@@ -276,14 +286,65 @@ EOF
 }
 
 # --- Module: UFW --------------------------------------------------------------
+# Fetches Cloudflare's published IP ranges. Sources:
+#   https://www.cloudflare.com/ips-v4
+#   https://www.cloudflare.com/ips-v6
+# These are the canonical endpoints documented at https://www.cloudflare.com/ips/.
+# Plain text, one CIDR per line.
+#
+# Fails loud if the endpoint is unreachable, returns non-200, or returns
+# anything that doesn't look like CIDR blocks. We never apply garbage to
+# UFW — better to leave the firewall untouched than to enable it with
+# rules that would lock everyone out.
+fetch_cloudflare_ranges() {
+  local v4 v6 cidr_re='^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$|^[0-9a-fA-F:]+/[0-9]{1,3}$'
+
+  v4="$(curl --fail --silent --show-error --max-time 10 https://www.cloudflare.com/ips-v4)" \
+    || { error "Could not fetch https://www.cloudflare.com/ips-v4"; return 1; }
+  v6="$(curl --fail --silent --show-error --max-time 10 https://www.cloudflare.com/ips-v6)" \
+    || { error "Could not fetch https://www.cloudflare.com/ips-v6"; return 1; }
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" =~ $cidr_re ]] || { error "Unexpected response from ips-v4 (not a CIDR): $line"; return 1; }
+  done <<< "$v4"
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" =~ $cidr_re ]] || { error "Unexpected response from ips-v6 (not a CIDR): $line"; return 1; }
+  done <<< "$v6"
+
+  CF_V4_RANGES="$v4"
+  CF_V6_RANGES="$v6"
+}
+
 setup_ufw() {
   info "Configuring UFW..."
+
+  # Pre-flight: if the operator chose Cloudflare-only, pull the ranges
+  # BEFORE we reset existing rules. A failure here leaves the firewall
+  # untouched instead of half-applied.
+  if [[ "$CLOUDFLARE_ONLY" == "yes" ]]; then
+    fetch_cloudflare_ranges || { error "Cloudflare-only mode aborted; firewall unchanged."; return 1; }
+  fi
+
   ufw --force reset
   ufw default deny incoming
   ufw default allow outgoing
 
   for port in $OPEN_PORTS; do
-    ufw allow "${port}/tcp"
+    if [[ "$CLOUDFLARE_ONLY" == "yes" ]]; then
+      while IFS= read -r cidr; do
+        [[ -z "$cidr" ]] && continue
+        ufw allow from "$cidr" to any port "$port" proto tcp comment "cloudflare-v4"
+      done <<< "$CF_V4_RANGES"
+      while IFS= read -r cidr; do
+        [[ -z "$cidr" ]] && continue
+        ufw allow from "$cidr" to any port "$port" proto tcp comment "cloudflare-v6"
+      done <<< "$CF_V6_RANGES"
+    else
+      ufw allow "${port}/tcp"
+    fi
   done
 
   if [[ "$USE_TAILSCALE" == "yes" ]]; then
@@ -293,7 +354,12 @@ setup_ufw() {
   fi
 
   ufw --force enable
-  success "UFW configured."
+  if [[ "$CLOUDFLARE_ONLY" == "yes" ]]; then
+    success "UFW configured (public ports restricted to Cloudflare ranges)."
+    warn "Cloudflare publishes new ranges occasionally. Re-run this wizard when the list at https://www.cloudflare.com/ips/ changes."
+  else
+    success "UFW configured."
+  fi
 }
 
 # --- Module: Fail2ban (no-Tailscale only) -------------------------------------
@@ -365,6 +431,9 @@ run_healthcheck() {
 
   # UFW
   check "UFW active" "ufw status | grep -q 'Status: active'"
+  if [[ "$CLOUDFLARE_ONLY" == "yes" ]]; then
+    check "UFW has Cloudflare allow rules" "ufw status | grep -q cloudflare-v4"
+  fi
 
   # Admin user
   check "Admin user '${ADMIN_USER}' exists" "id '$ADMIN_USER'"
