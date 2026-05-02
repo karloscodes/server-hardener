@@ -107,6 +107,7 @@ show_summary() {
   if [[ "$USE_TAILSCALE" == "yes" ]]; then
     info "SSH access:          Tailscale only (not reachable from public internet)"
     info "Tailscale:           yes"
+    info "Fail2ban:            removed if installed (redundant behind Tailscale)"
     if [[ -n "$TS_AUTHKEY" ]]; then
       info "Tailscale auth:      auth key provided"
     else
@@ -266,6 +267,8 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 ChallengeResponseAuthentication no
 PubkeyAuthentication yes
+AuthenticationMethods publickey
+AllowUsers ${ADMIN_USER}
 MaxAuthTries 3
 LoginGraceTime 30
 MaxStartups 10:30:100
@@ -364,7 +367,21 @@ setup_ufw() {
 
 # --- Module: Fail2ban (no-Tailscale only) -------------------------------------
 setup_fail2ban() {
-  [[ "$USE_TAILSCALE" == "yes" ]] && return 0
+  if [[ "$USE_TAILSCALE" == "yes" ]]; then
+    # Tailscale is the perimeter — fail2ban on top is redundant and just
+    # bans you from your own tailnet. If a previous hardening run left it
+    # installed, take it out cleanly and clear any leftover iptables chain.
+    if dpkg -l fail2ban 2>/dev/null | grep -q '^ii'; then
+      info "Tailscale enabled — removing fail2ban (redundant on tailnet-only SSH)..."
+      systemctl disable --now fail2ban >/dev/null 2>&1 || true
+      apt-get -y purge fail2ban >/dev/null 2>&1 || true
+      iptables -F f2b-sshd 2>/dev/null || true
+      iptables -X f2b-sshd 2>/dev/null || true
+      rm -f /etc/fail2ban/jail.local
+      success "Fail2ban removed."
+    fi
+    return 0
+  fi
 
   info "Configuring Fail2ban for sshd on port ${SSH_PORT}..."
   write_if_changed /etc/fail2ban/jail.local <<EOF
@@ -406,6 +423,41 @@ setup_tailscale() {
     success "Tailscale installed."
     warn "Run 'sudo tailscale up --ssh' to authenticate."
   fi
+
+  bind_ssh_to_tailscale
+}
+
+# Bind sshd to the Tailscale IP (defense-in-depth on top of the UFW
+# tailscale0-only allow rule). UFW already prevents public traffic from
+# reaching port 22, but if UFW were ever flushed, an unbound sshd would
+# accept it. Binding to the tailnet address removes that footgun.
+bind_ssh_to_tailscale() {
+  local ts_ip
+  ts_ip="$(tailscale ip -4 2>/dev/null | head -1 || true)"
+  if [[ -z "$ts_ip" ]]; then
+    warn "Tailscale IP not yet assigned — skipping ListenAddress binding."
+    warn "After 'sudo tailscale up --ssh', re-run this script to apply."
+    return 0
+  fi
+
+  local dropin="/etc/ssh/sshd_config.d/99-hardening.conf"
+  if grep -qE "^ListenAddress[[:space:]]+${ts_ip}\b" "$dropin" 2>/dev/null; then
+    return 0
+  fi
+
+  info "Binding sshd to Tailscale IP ${ts_ip}..."
+  # Strip any previous ListenAddress and append the current one. Idempotent
+  # across re-runs even if the Tailscale IP rotates.
+  sed -i '/^ListenAddress\b/d' "$dropin"
+  printf '\nListenAddress %s\n' "$ts_ip" >> "$dropin"
+
+  if ! sshd -t; then
+    error "sshd config test failed after adding ListenAddress — reverting."
+    sed -i '/^ListenAddress\b/d' "$dropin"
+    return 1
+  fi
+  systemctl reload ssh || systemctl reload sshd
+  success "sshd now bound to ${ts_ip} only."
 }
 
 # --- Health Check -------------------------------------------------------------
@@ -428,6 +480,8 @@ run_healthcheck() {
   check "SSH config valid" "sshd -t"
   check "Root login disabled" "grep -q 'PermitRootLogin no' /etc/ssh/sshd_config.d/99-hardening.conf"
   check "Password auth disabled" "grep -q 'PasswordAuthentication no' /etc/ssh/sshd_config.d/99-hardening.conf"
+  check "AuthenticationMethods=publickey" "grep -q 'AuthenticationMethods publickey' /etc/ssh/sshd_config.d/99-hardening.conf"
+  check "AllowUsers ${ADMIN_USER}" "grep -q 'AllowUsers ${ADMIN_USER}' /etc/ssh/sshd_config.d/99-hardening.conf"
 
   # UFW
   check "UFW active" "ufw status | grep -q 'Status: active'"
@@ -463,6 +517,10 @@ run_healthcheck() {
       warn "Tailscale not connected yet (run 'sudo tailscale up --ssh')"
     fi
     check "UFW allows SSH on tailscale0" "ufw status | grep -q tailscale0"
+    check "Fail2ban not installed" "! dpkg -l fail2ban 2>/dev/null | grep -q '^ii'"
+    if tailscale ip -4 >/dev/null 2>&1; then
+      check "sshd bound to Tailscale IP" "ss -tlnp | grep -q \"$(tailscale ip -4 | head -1):22\""
+    fi
   else
     check "Fail2ban running" "systemctl is-active fail2ban"
     check "Fail2ban sshd jail" "fail2ban-client status sshd"

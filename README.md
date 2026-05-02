@@ -16,8 +16,11 @@ The wizard asks 4 questions, shows a summary of changes, and asks for confirmati
 
 - Installs Tailscale, optionally authenticates with an auth key
 - SSH restricted to Tailscale interface only — **not reachable from the public internet**
-- No Fail2ban needed (nobody can reach SSH)
+- sshd binds to the Tailscale IP (defense-in-depth on top of the UFW rule)
+- Fail2ban is **removed** if previously installed (redundant on tailnet-only SSH and risks self-lockout)
 - UFW opens only 80/443 publicly
+
+> **Operational note:** with Tailscale-mode, your Tailscale account becomes the single point of failure for SSH access to every box. Enable 2FA on the Tailscale account and review your tailnet ACLs.
 
 ### Cloudflare-only mode (optional, on top of either mode above)
 
@@ -34,6 +37,8 @@ The wizard asks 4 questions, shows a summary of changes, and asks for confirmati
 ### Both modes
 
 - Admin user with key-only SSH + passwordless sudo
+- `AuthenticationMethods publickey` (cannot be silently weakened by another drop-in)
+- `AllowUsers <admin>` — only the configured admin can SSH
 - Root login disabled, password auth disabled
 - Kernel/network sysctl hardening
 - Unattended security upgrades (auto-reboot at 03:30)
