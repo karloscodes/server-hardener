@@ -78,17 +78,8 @@ run_wizard() {
 
   ADMIN_USER="$(ask "Admin username" "ubuntu")"
 
-  if ask_yn "Enable Tailscale?" "y"; then
-    USE_TAILSCALE="yes"
-    SSH_PORT=22
-
-    echo -e "  ${BLUE}Tip: Generate an auth key at https://login.tailscale.com/admin/settings/keys${NC}"
-    TS_AUTHKEY="$(ask "Tailscale auth key (leave empty to authenticate manually)" "")"
-  else
-    USE_TAILSCALE="no"
-    TS_AUTHKEY=""
-    SSH_PORT="$(ask "SSH port" "2222")"
-  fi
+  echo -e "  ${BLUE}Tip: Generate an auth key at https://login.tailscale.com/admin/settings/keys${NC}"
+  TS_AUTHKEY="$(ask "Tailscale auth key (leave empty to authenticate manually)" "")"
 
   OPEN_PORTS="$(ask "TCP ports to open publicly" "80 443")"
 
@@ -103,20 +94,14 @@ run_wizard() {
 show_summary() {
   echo -e "\n${BOLD}=== What will happen ===${NC}\n"
   info "Admin user:          ${ADMIN_USER} (sudo, passwordless, key-only)"
-  info "SSH port:            ${SSH_PORT}"
-  if [[ "$USE_TAILSCALE" == "yes" ]]; then
-    info "SSH access:          Tailscale only (not reachable from public internet)"
-    info "Tailscale:           yes"
-    info "Fail2ban:            removed if installed (redundant behind Tailscale)"
-    if [[ -n "$TS_AUTHKEY" ]]; then
-      info "Tailscale auth:      auth key provided"
-    else
-      info "Tailscale auth:      manual (you'll run 'tailscale up' after)"
-    fi
+  info "SSH access:          Tailscale only (not reachable from public internet)"
+  info "Tailscale:           installed and connected"
+  if [[ -n "$TS_AUTHKEY" ]]; then
+    info "Tailscale auth:      auth key provided"
   else
-    info "SSH access:          Public (protected by Fail2ban)"
-    info "Tailscale:           no"
+    info "Tailscale auth:      manual (you'll run 'tailscale up --ssh' after)"
   fi
+  info "Fail2ban:            removed if installed (redundant behind Tailscale)"
   if [[ "$CLOUDFLARE_ONLY" == "yes" ]]; then
     info "Public TCP ports:    ${OPEN_PORTS} (restricted to Cloudflare IP ranges)"
   else
@@ -185,9 +170,7 @@ setup_packages() {
 
   apt-get -y full-upgrade || true
 
-  local packages="ufw unattended-upgrades systemd-timesyncd"
-  [[ "$USE_TAILSCALE" == "no" ]] && packages="$packages fail2ban"
-  apt-get -y install $packages
+  apt-get -y install ufw unattended-upgrades systemd-timesyncd
 
   success "Packages installed."
 }
@@ -216,11 +199,8 @@ EOF
 setup_sysctl() {
   info "Applying sysctl hardening..."
 
-  local ip_forward=0
-  [[ "$USE_TAILSCALE" == "yes" ]] && ip_forward=1
-
-  write_if_changed /etc/sysctl.d/60-net-hardening.conf <<EOF
-net.ipv4.ip_forward=${ip_forward}
+  write_if_changed /etc/sysctl.d/60-net-hardening.conf <<'EOF'
+net.ipv4.ip_forward=1
 net.ipv4.conf.all.accept_redirects=0
 net.ipv4.conf.default.accept_redirects=0
 net.ipv4.conf.all.send_redirects=0
@@ -245,7 +225,7 @@ EOF
 
 # --- Module: SSH --------------------------------------------------------------
 setup_ssh() {
-  info "Hardening SSH (port ${SSH_PORT})..."
+  info "Hardening SSH (port 22, Tailscale-only)..."
 
   local ssh_dir="/etc/ssh/sshd_config.d"
   mkdir -p "$ssh_dir"
@@ -254,14 +234,8 @@ setup_ssh() {
   local backup="${dropin}.$(date +%F_%H%M%S).bak"
   [[ -f "$dropin" ]] && cp -a "$dropin" "$backup" || true
 
-  local port_line=""
-  if [[ "$USE_TAILSCALE" == "no" && "$SSH_PORT" != "22" ]]; then
-    port_line="Port ${SSH_PORT}"
-  fi
-
   write_if_changed "$dropin" <<EOF
 # Managed by server-hardener
-${port_line}
 PermitRootLogin no
 PasswordAuthentication no
 KbdInteractiveAuthentication no
@@ -285,7 +259,7 @@ EOF
     exit 1
   fi
   systemctl reload ssh || systemctl reload sshd
-  success "SSH hardened (port ${SSH_PORT})."
+  success "SSH hardened."
 }
 
 # --- Module: UFW --------------------------------------------------------------
@@ -350,11 +324,7 @@ setup_ufw() {
     fi
   done
 
-  if [[ "$USE_TAILSCALE" == "yes" ]]; then
-    ufw allow in on tailscale0 to any port 22 proto tcp
-  else
-    ufw limit "${SSH_PORT}/tcp"
-  fi
+  ufw allow in on tailscale0 to any port 22 proto tcp
 
   ufw --force enable
   if [[ "$CLOUDFLARE_ONLY" == "yes" ]]; then
@@ -365,50 +335,25 @@ setup_ufw() {
   fi
 }
 
-# --- Module: Fail2ban (no-Tailscale only) -------------------------------------
-setup_fail2ban() {
-  if [[ "$USE_TAILSCALE" == "yes" ]]; then
-    # Tailscale is the perimeter — fail2ban on top is redundant and just
-    # bans you from your own tailnet. If a previous hardening run left it
-    # installed, take it out cleanly and clear any leftover iptables chain.
-    if dpkg -l fail2ban 2>/dev/null | grep -q '^ii'; then
-      info "Tailscale enabled — removing fail2ban (redundant on tailnet-only SSH)..."
-      systemctl disable --now fail2ban >/dev/null 2>&1 || true
-      apt-get -y purge fail2ban >/dev/null 2>&1 || true
-      iptables -F f2b-sshd 2>/dev/null || true
-      iptables -X f2b-sshd 2>/dev/null || true
-      rm -f /etc/fail2ban/jail.local
-      success "Fail2ban removed."
-    fi
+# --- Module: Fail2ban cleanup -------------------------------------------------
+# Tailscale is the perimeter — fail2ban on top is redundant and risks
+# self-lockout. If a previous run installed it, take it out cleanly and
+# remove any leftover iptables chain.
+cleanup_fail2ban() {
+  if ! dpkg -l fail2ban 2>/dev/null | grep -q '^ii'; then
     return 0
   fi
-
-  info "Configuring Fail2ban for sshd on port ${SSH_PORT}..."
-  write_if_changed /etc/fail2ban/jail.local <<EOF
-[DEFAULT]
-bantime = 1h
-findtime = 10m
-maxretry = 5
-bantime.increment = true
-bantime.factor = 1.5
-bantime.formula = bantime * (1 + (failures / 6))
-
-[sshd]
-enabled = true
-port = ${SSH_PORT}
-logpath = %(sshd_log)s
-backend = systemd
-mode = aggressive
-EOF
-  enable_service_now fail2ban
-  fail2ban-client reload || true
-  success "Fail2ban configured."
+  info "Removing fail2ban (redundant on tailnet-only SSH)..."
+  systemctl disable --now fail2ban >/dev/null 2>&1 || true
+  apt-get -y purge fail2ban >/dev/null 2>&1 || true
+  iptables -F f2b-sshd 2>/dev/null || true
+  iptables -X f2b-sshd 2>/dev/null || true
+  rm -f /etc/fail2ban/jail.local
+  success "Fail2ban removed."
 }
 
 # --- Module: Tailscale --------------------------------------------------------
 setup_tailscale() {
-  [[ "$USE_TAILSCALE" != "yes" ]] && return 0
-
   info "Installing Tailscale..."
 
   if ! command -v tailscale >/dev/null 2>&1; then
@@ -500,34 +445,24 @@ run_healthcheck() {
   # Unattended upgrades
   check "Unattended upgrades enabled" "systemctl is-enabled unattended-upgrades"
 
-  # Mode-specific
-  if [[ "$USE_TAILSCALE" == "yes" ]]; then
-    check "Tailscale installed" "command -v tailscale"
-    if tailscale status >/dev/null 2>&1; then
-      check "Tailscale connected" "tailscale status"
-      local ts_ip
-      ts_ip="$(tailscale ip -4 2>/dev/null || true)"
-      if [[ -n "$ts_ip" ]]; then
-        success "Tailscale IP: ${ts_ip}"
-        ((passed++))
-      else
-        warn "Tailscale IP not assigned yet (run 'sudo tailscale up --ssh')"
-      fi
+  # Tailscale
+  check "Tailscale installed" "command -v tailscale"
+  if tailscale status >/dev/null 2>&1; then
+    check "Tailscale connected" "tailscale status"
+    local ts_ip
+    ts_ip="$(tailscale ip -4 2>/dev/null | head -1 || true)"
+    if [[ -n "$ts_ip" ]]; then
+      success "Tailscale IP: ${ts_ip}"
+      ((passed++))
+      check "sshd bound to Tailscale IP" "ss -tlnp | grep -q \"${ts_ip}:22\""
     else
-      warn "Tailscale not connected yet (run 'sudo tailscale up --ssh')"
-    fi
-    check "UFW allows SSH on tailscale0" "ufw status | grep -q tailscale0"
-    check "Fail2ban not installed" "! dpkg -l fail2ban 2>/dev/null | grep -q '^ii'"
-    if tailscale ip -4 >/dev/null 2>&1; then
-      check "sshd bound to Tailscale IP" "ss -tlnp | grep -q \"$(tailscale ip -4 | head -1):22\""
+      warn "Tailscale IP not assigned yet (run 'sudo tailscale up --ssh')"
     fi
   else
-    check "Fail2ban running" "systemctl is-active fail2ban"
-    check "Fail2ban sshd jail" "fail2ban-client status sshd"
-    if [[ "$SSH_PORT" != "22" ]]; then
-      check "SSH on custom port ${SSH_PORT}" "grep -q 'Port ${SSH_PORT}' /etc/ssh/sshd_config.d/99-hardening.conf"
-    fi
+    warn "Tailscale not connected yet (run 'sudo tailscale up --ssh')"
   fi
+  check "UFW allows SSH on tailscale0" "ufw status | grep -q tailscale0"
+  check "Fail2ban not installed" "! dpkg -l fail2ban 2>/dev/null | grep -q '^ii'"
 
   echo -e "\n${BOLD}Results: ${GREEN}${passed} passed${NC}, ${RED}${failed} failed${NC}\n"
 
@@ -550,18 +485,17 @@ main() {
   setup_sysctl
   setup_ssh
   setup_ufw
-  setup_fail2ban
+  cleanup_fail2ban
   setup_tailscale
 
   run_healthcheck
 
   echo -e "${BOLD}=== Done ===${NC}\n"
   info "Admin user: ${ADMIN_USER}"
-  info "SSH port:   ${SSH_PORT}"
-  if [[ "$USE_TAILSCALE" == "yes" && -z "${TS_AUTHKEY:-}" ]]; then
+  if [[ -z "${TS_AUTHKEY:-}" ]]; then
     warn "Next step: sudo tailscale up --ssh"
   fi
-  echo -e "\n  Test: ${BOLD}ssh ${ADMIN_USER}@<server-ip>${SSH_PORT:+ -p $SSH_PORT}${NC}\n"
+  echo -e "\n  Test: ${BOLD}ssh ${ADMIN_USER}@<tailscale-host>${NC}\n"
 }
 
 [[ "${BASH_SOURCE[0]}" == "$0" ]] && main "$@"
