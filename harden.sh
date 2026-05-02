@@ -185,10 +185,12 @@ APT::Periodic::Download-Upgradeable-Packages "1";
 APT::Periodic::AutocleanInterval "7";
 APT::Periodic::Verbose "1";
 EOF
+  # 04:30 (not 03:30) so we don't race with app cron jobs that commonly
+  # fire at the top/half of the 3 AM hour.
   write_if_changed /etc/apt/apt.conf.d/50unattended-upgrades-local <<'EOF'
 Unattended-Upgrade::Remove-Unused-Dependencies "true";
 Unattended-Upgrade::Automatic-Reboot "true";
-Unattended-Upgrade::Automatic-Reboot-Time "03:30";
+Unattended-Upgrade::Automatic-Reboot-Time "04:30";
 EOF
   enable_service_now unattended-upgrades
   enable_service_now systemd-timesyncd
@@ -234,13 +236,16 @@ setup_ssh() {
   local backup="${dropin}.$(date +%F_%H%M%S).bak"
   [[ -f "$dropin" ]] && cp -a "$dropin" "$backup" || true
 
+  # AuthenticationMethods=publickey is the authoritative source of truth;
+  # it implies PubkeyAuthentication and forbids everything else, even if a
+  # later drop-in tries to re-enable passwords. So we don't list
+  # PubkeyAuthentication separately — single source of truth.
   write_if_changed "$dropin" <<EOF
 # Managed by server-hardener
 PermitRootLogin no
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 ChallengeResponseAuthentication no
-PubkeyAuthentication yes
 AuthenticationMethods publickey
 AllowUsers ${ADMIN_USER}
 MaxAuthTries 3
@@ -402,6 +407,16 @@ bind_ssh_to_tailscale() {
     return 1
   fi
   systemctl reload ssh || systemctl reload sshd
+
+  # On socket-activated sshd (Ubuntu 24.04 default), the actual port
+  # binding lives in ssh.socket — generated from sshd_config's
+  # ListenAddress by systemd-sshd-generator. Generators only run at
+  # boot or on daemon-reload, and the socket itself needs a restart
+  # to pick up the new bind. Existing SSH sessions survive both.
+  if systemctl is-active --quiet ssh.socket; then
+    systemctl daemon-reload
+    systemctl restart ssh.socket
+  fi
   success "sshd now bound to ${ts_ip} only."
 }
 
