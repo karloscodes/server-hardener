@@ -203,6 +203,10 @@ setup_sysctl() {
 
   write_if_changed /etc/sysctl.d/60-net-hardening.conf <<'EOF'
 net.ipv4.ip_forward=1
+# Let sshd / ssh.socket bind the Tailscale IP before tailscaled has assigned
+# it. Without this, the 04:30 auto-reboot can race: if ssh.socket binds
+# 100.x:22 before tailscale0 exists, the bind fails and SSH never comes up.
+net.ipv4.ip_nonlocal_bind=1
 net.ipv4.conf.all.accept_redirects=0
 net.ipv4.conf.default.accept_redirects=0
 net.ipv4.conf.all.send_redirects=0
@@ -381,6 +385,10 @@ setup_tailscale() {
 # tailscale0-only allow rule). UFW already prevents public traffic from
 # reaching port 22, but if UFW were ever flushed, an unbound sshd would
 # accept it. Binding to the tailnet address removes that footgun.
+#
+# Reboot-safe via net.ipv4.ip_nonlocal_bind=1 (see setup_sysctl): the bind
+# succeeds even when tailscale0 hasn't come up yet, so a boot ordering race
+# can't lock SSH out.
 bind_ssh_to_tailscale() {
   local ts_ip
   ts_ip="$(tailscale ip -4 2>/dev/null | head -1 || true)"
