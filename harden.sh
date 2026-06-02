@@ -398,6 +398,14 @@ bind_ssh_to_tailscale() {
     return 0
   fi
 
+  # Guard against garbage (warning lines, partial output) being written as
+  # ListenAddress — a malformed value makes 'sshd -t' fail and can lock SSH.
+  # Tailnet IPv4 always lives in 100.64.0.0/10 (CGNAT range).
+  if [[ ! "$ts_ip" =~ ^100\.([6-9][4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+    warn "Unexpected Tailscale IP '${ts_ip}' — skipping ListenAddress binding."
+    return 0
+  fi
+
   local dropin="/etc/ssh/sshd_config.d/99-hardening.conf"
   if grep -qE "^ListenAddress[[:space:]]+${ts_ip}\b" "$dropin" 2>/dev/null; then
     return 0
@@ -435,11 +443,13 @@ run_healthcheck() {
 
   check() {
     local label="$1"; shift
-    if eval "$@" >/dev/null 2>&1; then
+    local out
+    if out="$(eval "$@" 2>&1)"; then
       success "$label"
       ((passed++))
     else
       error "FAIL: $label"
+      [[ -n "$out" ]] && echo "$out" | sed 's/^/         /' >&2
       ((failed++))
     fi
   }
