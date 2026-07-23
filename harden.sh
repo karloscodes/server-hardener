@@ -78,7 +78,7 @@ detect_admin_user() {
 }
 
 detect_open_ports() {
-  ufw status 2>/dev/null | grep -v tailscale0 | grep -oP '^\d+(?=/tcp\b)' | sort -un | tr '\n' ' ' | sed 's/[[:space:]]*$//'
+  ufw status 2>/dev/null | grep -v tailscale0 | grep -oP '^\d+(?=/tcp\b)' | sort -un | tr '\n' ' ' | sed 's/[[:space:]]*$//' || true
 }
 
 KEY_EXPIRY_MARKER="/etc/server-hardener/key-expiry-disabled"
@@ -547,7 +547,7 @@ disable_key_expiry() {
   fi
 
   local device_id
-  device_id="$(tailscale status --json 2>/dev/null | jq -r '.Self.ID // empty')"
+  device_id="$(tailscale status --json 2>/dev/null | jq -r '.Self.ID // empty' || true)"
   if [[ -z "$device_id" ]]; then
     warn "Tailscale not connected yet — can't disable key expiry. Re-run this script after 'tailscale up --ssh'."
     return 0
