@@ -68,6 +68,14 @@ sudo bash harden.sh fix      # re-applies the self-contained hardening steps, th
 
 Both auto-detect the admin user (from the existing `AllowUsers` line) and open ports (from existing UFW rules) instead of asking. `fix` re-applies everything that doesn't need a new secret — UFW, sysctl, admin user/SSH, unattended upgrades, fail2ban cleanup, the Tailscale IP binding, and the Docker/UFW fix. Anything that genuinely needs a fresh secret (Tailscale auth key, API token) isn't touched — run the full wizard (`sudo bash harden.sh`) for those instead.
 
+## Testing
+
+```bash
+bash tests/harden_test.sh
+```
+
+Unit tests for the pure detection/validation functions (`detect_admin_user`, `detect_open_ports`, the Cloudflare CIDR and Tailscale-IP regexes) plus a static guard against the exact `set -e`/`((var++))` footgun that has twice caused this script to die silently mid-run. Runs on macOS too, though a few tests skip there (BSD `grep` doesn't support `-P`; `harden.sh` itself only ever runs on Ubuntu, where that's not a concern). This doesn't cover the `setup_*` modules themselves — those mutate a real system (packages, UFW, sshd, sysctl) and can only be meaningfully verified against an actual Ubuntu box.
+
 ## Requirements
 
 - Ubuntu 24.04 LTS
