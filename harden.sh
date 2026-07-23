@@ -644,15 +644,16 @@ run_healthcheck() {
     local out
     if out="$(eval "$@" 2>&1)"; then
       success "$label"
-      ((passed++))
+      passed=$((passed + 1))
     else
       error "FAIL: $label"
       [[ -n "$out" ]] && echo "$out" | sed 's/^/         /' >&2
-      ((failed++))
+      failed=$((failed + 1))
     fi
   }
 
   # SSH
+  mkdir -p /run/sshd
   check "SSH config valid" "sshd -t"
   check "Root login disabled" "grep -q 'PermitRootLogin no' /etc/ssh/sshd_config.d/99-hardening.conf"
   check "Password auth disabled" "grep -q 'PasswordAuthentication no' /etc/ssh/sshd_config.d/99-hardening.conf"
@@ -689,7 +690,7 @@ run_healthcheck() {
     ts_ip="$(tailscale ip -4 2>/dev/null | head -1 || true)"
     if [[ -n "$ts_ip" ]]; then
       success "Tailscale IP: ${ts_ip}"
-      ((passed++))
+      passed=$((passed + 1))
       check "sshd bound to Tailscale IP" "ss -tlnp | grep -q \"${ts_ip}:22\""
     else
       warn "Tailscale IP not assigned yet (run 'sudo tailscale up --ssh')"
