@@ -78,7 +78,11 @@ detect_admin_user() {
 }
 
 detect_open_ports() {
-  ufw status 2>/dev/null | grep -v tailscale0 | grep -oP '^\d+(?=/tcp\b)' | sort -un | tr '\n' ' ' | sed 's/[[:space:]]*$//' || true
+  # Exclude port 22 explicitly — SSH is always Tailscale-only via its own
+  # dedicated rule, never part of the general Cloudflare-restrict set. A
+  # box with pre-existing (wrong) "22/tcp Anywhere" exposure would
+  # otherwise get that mistake "preserved" into the Cloudflare allowlist.
+  ufw status 2>/dev/null | grep -v tailscale0 | grep -oP '^\d+(?=/tcp\b)' | grep -v '^22$' | sort -un | tr '\n' ' ' | sed 's/[[:space:]]*$//' || true
 }
 
 KEY_EXPIRY_MARKER="/etc/server-hardener/key-expiry-disabled"
