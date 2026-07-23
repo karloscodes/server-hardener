@@ -72,31 +72,52 @@ check_preconditions() {
   export DEBIAN_FRONTEND=noninteractive
 }
 
+# --- State detection (wizard defaults + doctor/fix) ----------------------------
+detect_admin_user() {
+  grep -oP '^AllowUsers \K.*' /etc/ssh/sshd_config.d/99-hardening.conf 2>/dev/null || true
+}
+
+detect_open_ports() {
+  ufw status 2>/dev/null | grep -v tailscale0 | grep -oP '^\d+(?=/tcp\b)' | sort -un | tr '\n' ' ' | sed 's/[[:space:]]*$//'
+}
+
+KEY_EXPIRY_MARKER="/etc/server-hardener/key-expiry-disabled"
+
 # --- Wizard -------------------------------------------------------------------
 run_wizard() {
   echo -e "\n${BOLD}=== Server Hardener ===${NC}\n"
 
-  ADMIN_USER="$(ask "Admin username" "ubuntu")"
+  ADMIN_USER="$(ask "Admin username" "$(detect_admin_user)")"
+  [[ -n "$ADMIN_USER" ]] || ADMIN_USER="ubuntu"
 
-  echo -e "  ${BLUE}Tip: Generate an auth key at https://login.tailscale.com/admin/settings/keys${NC}"
-  TS_AUTHKEY="$(ask "Tailscale auth key (leave empty to authenticate manually)" "")"
-
-  echo -e "  ${BLUE}Tailscale node keys expire by default (~180 days). Since SSH here is${NC}"
-  echo -e "  ${BLUE}Tailscale-only, an expired key disconnects the device and locks you out${NC}"
-  echo -e "  ${BLUE}of SSH with no fallback. Disabling expiry removes that risk, at the${NC}"
-  echo -e "  ${BLUE}cost of a leaked auth key staying valid until you revoke it by hand.${NC}"
-  if ask_yn "Disable Tailscale key expiry for this device?" "y"; then
-    DISABLE_KEY_EXPIRY="yes"
-    TS_API_TOKEN="$(ask "Tailscale API access token (admin console > Settings > Keys; leave empty to disable manually later)" "")"
+  if tailscale status >/dev/null 2>&1; then
+    info "Tailscale already connected — skipping auth key question."
+    TS_AUTHKEY=""
   else
-    DISABLE_KEY_EXPIRY="no"
-    TS_API_TOKEN=""
+    echo -e "  ${BLUE}Tip: Generate an auth key at https://login.tailscale.com/admin/settings/keys${NC}"
+    TS_AUTHKEY="$(ask "Tailscale auth key (leave empty to authenticate manually)" "")"
   fi
 
-  echo -e "  ${BLUE}Public ingress is Cloudflare Tunnel only — no port 80/443 is opened on${NC}"
-  echo -e "  ${BLUE}this box. Create a tunnel + Public Hostname route at${NC}"
-  echo -e "  ${BLUE}https://one.dash.cloudflare.com/ > Networks > Tunnels, then paste its token.${NC}"
-  CF_TUNNEL_TOKEN="$(ask "Cloudflare Tunnel token (leave empty to configure manually later)" "")"
+  if [[ -f "$KEY_EXPIRY_MARKER" ]]; then
+    info "Tailscale key expiry already disabled — skipping."
+    DISABLE_KEY_EXPIRY="already"
+    TS_API_TOKEN=""
+  else
+    echo -e "  ${BLUE}Tailscale node keys expire by default (~180 days). Since SSH here is${NC}"
+    echo -e "  ${BLUE}Tailscale-only, an expired key disconnects the device and locks you out${NC}"
+    echo -e "  ${BLUE}of SSH with no fallback. Disabling expiry removes that risk, at the${NC}"
+    echo -e "  ${BLUE}cost of a leaked auth key staying valid until you revoke it by hand.${NC}"
+    if ask_yn "Disable Tailscale key expiry for this device?" "y"; then
+      DISABLE_KEY_EXPIRY="yes"
+      TS_API_TOKEN="$(ask "Tailscale API access token (admin console > Settings > Keys; leave empty to disable manually later)" "")"
+    else
+      DISABLE_KEY_EXPIRY="no"
+      TS_API_TOKEN=""
+    fi
+  fi
+
+  OPEN_PORTS="$(ask "TCP ports to open publicly" "$(detect_open_ports)")"
+  [[ -n "$OPEN_PORTS" ]] || OPEN_PORTS="80 443"
 }
 
 # --- Summary ------------------------------------------------------------------
@@ -107,10 +128,14 @@ show_summary() {
   info "Tailscale:           installed and connected"
   if [[ -n "$TS_AUTHKEY" ]]; then
     info "Tailscale auth:      auth key provided"
+  elif tailscale status >/dev/null 2>&1; then
+    info "Tailscale auth:      already connected"
   else
     info "Tailscale auth:      manual (you'll run 'tailscale up --ssh' after)"
   fi
-  if [[ "$DISABLE_KEY_EXPIRY" == "yes" ]]; then
+  if [[ "$DISABLE_KEY_EXPIRY" == "already" ]]; then
+    info "Tailscale key expiry: already disabled"
+  elif [[ "$DISABLE_KEY_EXPIRY" == "yes" ]]; then
     if [[ -n "$TS_API_TOKEN" ]]; then
       info "Tailscale key expiry: disabled via API"
     else
@@ -120,12 +145,8 @@ show_summary() {
     info "Tailscale key expiry: left at default (~180 days)"
   fi
   info "Fail2ban:            removed if installed (redundant behind Tailscale)"
-  if [[ -n "$CF_TUNNEL_TOKEN" ]]; then
-    info "Public ingress:      Cloudflare Tunnel (no listening port)"
-  else
-    info "Public ingress:      none configured (add a tunnel token and re-run)"
-  fi
-  info "Firewall:            UFW (deny incoming, allow outgoing; no public ports)"
+  info "Public TCP ports:    ${OPEN_PORTS} (restricted to Cloudflare IP ranges)"
+  info "Firewall:            UFW (deny incoming, allow outgoing)"
   info "Unattended upgrades: enabled (auto-reboot 03:30)"
   info "Sysctl hardening:    enabled"
   echo ""
@@ -290,78 +311,182 @@ EOF
 }
 
 # --- Module: UFW --------------------------------------------------------------
-# No public TCP ports at all — public ingress is Cloudflare Tunnel, which is
-# an outbound-only connection from this box, so it needs no inbound allow
-# rule. Only Tailscale-sourced SSH is ever allowed in.
+# Fetches Cloudflare's published IP ranges. Sources:
+#   https://www.cloudflare.com/ips-v4
+#   https://www.cloudflare.com/ips-v6
+# These are the canonical endpoints documented at https://www.cloudflare.com/ips/.
+# Plain text, one CIDR per line.
+#
+# Fails loud if the endpoint is unreachable, returns non-200, or returns
+# anything that doesn't look like CIDR blocks. We never apply garbage to
+# UFW — better to leave the firewall untouched than to enable it with
+# rules that would lock everyone out.
+fetch_cloudflare_ranges() {
+  local v4 v6 cidr_re='^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$|^[0-9a-fA-F:]+/[0-9]{1,3}$'
+
+  v4="$(curl --fail --silent --show-error --max-time 10 https://www.cloudflare.com/ips-v4)" \
+    || { error "Could not fetch https://www.cloudflare.com/ips-v4"; return 1; }
+  v6="$(curl --fail --silent --show-error --max-time 10 https://www.cloudflare.com/ips-v6)" \
+    || { error "Could not fetch https://www.cloudflare.com/ips-v6"; return 1; }
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" =~ $cidr_re ]] || { error "Unexpected response from ips-v4 (not a CIDR): $line"; return 1; }
+  done <<< "$v4"
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" =~ $cidr_re ]] || { error "Unexpected response from ips-v6 (not a CIDR): $line"; return 1; }
+  done <<< "$v6"
+
+  CF_V4_RANGES="$v4"
+  CF_V6_RANGES="$v6"
+}
+
 setup_ufw() {
   info "Configuring UFW..."
+
+  # Pre-flight: if the operator chose Cloudflare-only, pull the ranges
+  # BEFORE we reset existing rules. A failure here leaves the firewall
+  # untouched instead of half-applied.
+  fetch_cloudflare_ranges || { error "Aborted; firewall unchanged."; return 1; }
 
   ufw --force reset
   ufw default deny incoming
   ufw default allow outgoing
+
+  for port in $OPEN_PORTS; do
+    while IFS= read -r cidr; do
+      [[ -z "$cidr" ]] && continue
+      ufw allow from "$cidr" to any port "$port" proto tcp comment "cloudflare-v4"
+    done <<< "$CF_V4_RANGES"
+    while IFS= read -r cidr; do
+      [[ -z "$cidr" ]] && continue
+      ufw allow from "$cidr" to any port "$port" proto tcp comment "cloudflare-v6"
+    done <<< "$CF_V6_RANGES"
+  done
+
   ufw allow in on tailscale0 to any port 22 proto tcp
+
   ufw --force enable
-  success "UFW configured."
+  success "UFW configured (public ports restricted to Cloudflare ranges)."
+  warn "Cloudflare publishes new ranges occasionally. Re-run this wizard when the list at https://www.cloudflare.com/ips/ changes."
+
+  harden_docker_forwarding
 }
 
-# --- Module: Cloudflare Tunnel -------------------------------------------------
-# Sole public-ingress path — no UFW allow rule needed since the tunnel is an
-# outbound-only connection from this box to Cloudflare's edge.
+# Docker manipulates iptables directly to publish container ports, inserting
+# FORWARD-chain rules that UFW's INPUT-chain rules never see — `ufw status`
+# can report traffic restricted to Cloudflare's ranges while a container's
+# `-p 80:80` is still reachable from anyone on the internet, because Docker
+# ignores UFW's own rules entirely for published ports. DOCKER-USER is the
+# empty chain Docker reserves for exactly this kind of admin override.
 #
-# Deliberately does NOT use `cloudflared service install <token>`: that
-# command bakes the raw token into the generated systemd unit's ExecStart
-# line, so it sits in plaintext in the unit file and stays visible in
-# `ps`/`/proc/<pid>/cmdline` for the life of the service. Instead we store
-# the token in a root-only file and point cloudflared at it with
-# --token-file (supported since cloudflared 2025.4.0), same file-based
-# secret pattern used for TS_AUTHKEY and the Tailscale API token above.
-setup_cloudflare_tunnel() {
-  if [[ -z "${CF_TUNNEL_TOKEN:-}" ]]; then
-    warn "No Cloudflare Tunnel token given — skipping. Add one and re-run this wizard to enable public ingress."
+# Mirrors the same Cloudflare-IP allowlist UFW is already trying to
+# enforce, at the layer Docker actually respects. Verified live against a
+# real Docker/UFW setup: closes external access to published ports while
+# leaving container-initiated outbound traffic (updates, API calls)
+# untouched via the RELATED,ESTABLISHED allowance.
+harden_docker_forwarding() {
+  command -v docker >/dev/null 2>&1 || return 0
+
+  local pub_iface
+  pub_iface="$(ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}')"
+  if [[ -z "$pub_iface" ]]; then
+    warn "Could not detect the public network interface — skipping Docker/UFW bypass fix. Docker-published ports may be reachable from the internet regardless of UFW rules."
     return 0
   fi
 
-  info "Installing Cloudflare Tunnel (cloudflared)..."
+  # v4 and v6 CIDRs must go into separate rule files: after.rules is
+  # applied via iptables-restore (v4 only) and after6.rules via
+  # ip6tables-restore (v6 only). Mixing a v6 address into the v4 file
+  # would make iptables-restore choke on an invalid address.
+  local docker_user_rules_v4="" docker_user_rules_v6=""
+  while IFS= read -r cidr; do
+    [[ -z "$cidr" ]] && continue
+    docker_user_rules_v4+="-A DOCKER-USER -i ${pub_iface} -s ${cidr} -j RETURN
+"
+  done <<< "$CF_V4_RANGES"
+  while IFS= read -r cidr; do
+    [[ -z "$cidr" ]] && continue
+    docker_user_rules_v6+="-A DOCKER-USER -i ${pub_iface} -s ${cidr} -j RETURN
+"
+  done <<< "$CF_V6_RANGES"
 
-  if ! command -v cloudflared >/dev/null 2>&1; then
-    local arch deb
-    arch="$(dpkg --print-architecture)"
-    deb="$(mktemp /tmp/cloudflared.XXXXXX.deb)"
-    curl --fail --silent --show-error --location \
-      -o "$deb" \
-      "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}.deb"
-    dpkg -i "$deb"
-    rm -f "$deb"
-  fi
+  write_if_changed /etc/ufw/after.rules <<EOF
+#
+# rules.input-after
+#
+# Rules that should be run after the ufw command line added rules. Custom
+# rules should be added to one of these chains:
+#   ufw-after-input
+#   ufw-after-output
+#   ufw-after-forward
+#
 
-  local cloudflared_bin
-  cloudflared_bin="$(command -v cloudflared)"
+# Don't delete these required lines, otherwise there will be errors
+*filter
+:ufw-after-input - [0:0]
+:ufw-after-output - [0:0]
+:ufw-after-forward - [0:0]
+# End required lines
 
-  install -d -m 700 -o root -g root /etc/cloudflared
-  printf '%s' "$CF_TUNNEL_TOKEN" > /etc/cloudflared/token
-  chmod 600 /etc/cloudflared/token
-  chown root:root /etc/cloudflared/token
+# don't log noisy services by default
+-A ufw-after-input -p udp --dport 137 -j ufw-skip-to-policy-input
+-A ufw-after-input -p udp --dport 138 -j ufw-skip-to-policy-input
+-A ufw-after-input -p tcp --dport 139 -j ufw-skip-to-policy-input
+-A ufw-after-input -p tcp --dport 445 -j ufw-skip-to-policy-input
+-A ufw-after-input -p udp --dport 67 -j ufw-skip-to-policy-input
+-A ufw-after-input -p udp --dport 68 -j ufw-skip-to-policy-input
 
-  write_if_changed /etc/systemd/system/cloudflared.service <<EOF
-[Unit]
-Description=Cloudflare Tunnel
-After=network-online.target
-Wants=network-online.target
+# don't log noisy broadcast
+-A ufw-after-input -m addrtype --dst-type BROADCAST -j ufw-skip-to-policy-input
 
-[Service]
-Type=notify
-ExecStart=${cloudflared_bin} --no-autoupdate tunnel run --token-file /etc/cloudflared/token
-Restart=on-failure
-RestartSec=5
-User=root
+# server-hardener: Docker publishes container ports directly via iptables,
+# bypassing ufw's INPUT chain entirely. DOCKER-USER is the placeholder
+# chain Docker reserves for admin overrides; iptables-restore replaces its
+# contents with just these rules on every apply, so this is idempotent.
+# Mirrors the Cloudflare-IP allowlist UFW enforces, since Docker ignores
+# UFW's own rules for published ports.
+:DOCKER-USER - [0:0]
+-A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+${docker_user_rules_v4}-A DOCKER-USER -i ${pub_iface} -j DROP
 
-[Install]
-WantedBy=multi-user.target
+# don't delete the 'COMMIT' line or these rules won't be processed
+COMMIT
 EOF
 
-  systemctl daemon-reload
-  enable_service_now cloudflared.service
-  success "Cloudflare Tunnel running."
+  write_if_changed /etc/ufw/after6.rules <<EOF
+#
+# rules.input-after for IPv6
+#
+# Rules that should be run after the ufw command line added rules. Custom
+# rules should be added to one of these chains:
+#   ufw6-after-input
+#   ufw6-after-output
+#   ufw6-after-forward
+#
+
+# Don't delete these required lines, otherwise there will be errors
+*filter
+:ufw6-after-input - [0:0]
+:ufw6-after-output - [0:0]
+:ufw6-after-forward - [0:0]
+# End required lines
+
+# server-hardener: IPv6 counterpart to after.rules — see that file for why
+# this exists. Applied via ip6tables-restore, so v6 CIDRs must live here,
+# not in the v4 file.
+:DOCKER-USER - [0:0]
+-A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+${docker_user_rules_v6}-A DOCKER-USER -i ${pub_iface} -j DROP
+
+# don't delete the 'COMMIT' line or these rules won't be processed
+COMMIT
+EOF
+
+  ufw reload >/dev/null
+  success "Docker/UFW bypass closed for Cloudflare-restricted ports (public interface: ${pub_iface})."
 }
 
 # --- Module: Fail2ban cleanup -------------------------------------------------
@@ -446,6 +571,8 @@ disable_key_expiry() {
   shred -u "$netrc" 2>/dev/null || rm -f "$netrc"
 
   if [[ $ok -eq 0 ]]; then
+    install -d -m 755 /etc/server-hardener
+    touch "$KEY_EXPIRY_MARKER"
     success "Key expiry disabled for this device."
   else
     error "Failed to disable key expiry via API — do it manually via the admin console."
@@ -530,15 +657,23 @@ run_healthcheck() {
   check "Root login disabled" "grep -q 'PermitRootLogin no' /etc/ssh/sshd_config.d/99-hardening.conf"
   check "Password auth disabled" "grep -q 'PasswordAuthentication no' /etc/ssh/sshd_config.d/99-hardening.conf"
   check "AuthenticationMethods=publickey" "grep -q 'AuthenticationMethods publickey' /etc/ssh/sshd_config.d/99-hardening.conf"
-  check "AllowUsers ${ADMIN_USER}" "grep -q 'AllowUsers ${ADMIN_USER}' /etc/ssh/sshd_config.d/99-hardening.conf"
 
   # UFW
   check "UFW active" "ufw status | grep -q 'Status: active'"
+  check "UFW has Cloudflare allow rules" "ufw status | grep -q cloudflare-v4"
+  if command -v docker >/dev/null 2>&1; then
+    check "Docker/UFW bypass closed" "iptables -L DOCKER-USER -n 2>/dev/null | grep -qE 'DROP.*0\\.0\\.0\\.0/0'"
+  fi
 
   # Admin user
-  check "Admin user '${ADMIN_USER}' exists" "id '$ADMIN_USER'"
-  check "Admin user has sudo" "groups '$ADMIN_USER' | grep -q sudo"
-  check "Sudoers file valid" "visudo -cf '/etc/sudoers.d/90-${ADMIN_USER}-nopasswd'"
+  if [[ -n "$ADMIN_USER" ]]; then
+    check "AllowUsers ${ADMIN_USER}" "grep -q 'AllowUsers ${ADMIN_USER}' /etc/ssh/sshd_config.d/99-hardening.conf"
+    check "Admin user '${ADMIN_USER}' exists" "id '$ADMIN_USER'"
+    check "Admin user has sudo" "groups '$ADMIN_USER' | grep -q sudo"
+    check "Sudoers file valid" "visudo -cf '/etc/sudoers.d/90-${ADMIN_USER}-nopasswd'"
+  else
+    warn "No admin user detected — skipping admin-user checks."
+  fi
 
   # Sysctl
   check "Sysctl hardening applied" "test -f /etc/sysctl.d/60-net-hardening.conf"
@@ -560,31 +695,14 @@ run_healthcheck() {
       warn "Tailscale IP not assigned yet (run 'sudo tailscale up --ssh')"
     fi
 
-    if [[ "${DISABLE_KEY_EXPIRY:-no}" == "yes" && -n "${TS_API_TOKEN:-}" ]]; then
-      local device_id netrc expiry_disabled
-      device_id="$(tailscale status --json 2>/dev/null | jq -r '.Self.ID // empty')"
-      if [[ -n "$device_id" ]]; then
-        netrc="$(mktemp /tmp/ts-netrc.XXXXXX)"
-        chmod 600 "$netrc"
-        printf 'machine api.tailscale.com\nlogin %s\npassword\n' "$TS_API_TOKEN" > "$netrc"
-        expiry_disabled="$(curl --fail --silent --netrc-file "$netrc" \
-          "https://api.tailscale.com/api/v2/device/${device_id}" 2>/dev/null \
-          | jq -r '.keyExpiryDisabled // false')"
-        shred -u "$netrc" 2>/dev/null || rm -f "$netrc"
-        check "Tailscale key expiry disabled" "[[ '$expiry_disabled' == 'true' ]]"
-      fi
+    if [[ -f "$KEY_EXPIRY_MARKER" ]]; then
+      check "Tailscale key expiry disabled" "true"
     fi
   else
     warn "Tailscale not connected yet (run 'sudo tailscale up --ssh')"
   fi
   check "UFW allows SSH on tailscale0" "ufw status | grep -q tailscale0"
   check "Fail2ban not installed" "! dpkg -l fail2ban 2>/dev/null | grep -q '^ii'"
-
-  # Cloudflare Tunnel
-  if [[ -n "${CF_TUNNEL_TOKEN:-}" ]]; then
-    check "cloudflared installed" "command -v cloudflared"
-    check "Cloudflare Tunnel service active" "systemctl is-active --quiet cloudflared"
-  fi
 
   echo -e "\n${BOLD}Results: ${GREEN}${passed} passed${NC}, ${RED}${failed} failed${NC}\n"
 
@@ -607,7 +725,6 @@ main() {
   setup_sysctl
   setup_ssh
   setup_ufw
-  setup_cloudflare_tunnel
   cleanup_fail2ban
   setup_tailscale
 
@@ -615,10 +732,63 @@ main() {
 
   echo -e "${BOLD}=== Done ===${NC}\n"
   info "Admin user: ${ADMIN_USER}"
-  if [[ -z "${TS_AUTHKEY:-}" ]]; then
+  if [[ -z "${TS_AUTHKEY:-}" ]] && ! tailscale status >/dev/null 2>&1; then
     warn "Next step: sudo tailscale up --ssh"
   fi
   echo -e "\n  Test: ${BOLD}ssh ${ADMIN_USER}@<tailscale-host>${NC}\n"
 }
 
-[[ "${BASH_SOURCE[0]}" == "$0" ]] && main "$@"
+# --- Doctor / Fix ---------------------------------------------------------------
+# doctor: read-only diagnostics using auto-detected state, no prompts, no
+# changes. fix: re-applies the self-contained setup_* modules using that
+# same detected state, then re-runs the healthcheck. Neither one re-prompts
+# for secrets (auth key, API token) that aren't stored anywhere on disk —
+# anything that genuinely needs a new secret is left for the full wizard.
+run_doctor() {
+  check_preconditions
+  ADMIN_USER="$(detect_admin_user)"
+  OPEN_PORTS="$(detect_open_ports)"
+  run_healthcheck
+}
+
+run_fix() {
+  check_preconditions
+  ADMIN_USER="$(detect_admin_user)"
+  OPEN_PORTS="$(detect_open_ports)"
+  [[ -n "$OPEN_PORTS" ]] || OPEN_PORTS="80 443"
+
+  info "Re-applying self-contained hardening steps..."
+  setup_packages
+  setup_unattended_upgrades
+  setup_sysctl
+
+  if [[ -n "$ADMIN_USER" ]]; then
+    setup_admin_user
+    setup_ssh
+  else
+    warn "Could not detect admin user (no AllowUsers in sshd config) — skipping admin-user/SSH repair. Run the full wizard instead."
+  fi
+
+  setup_ufw
+  cleanup_fail2ban
+
+  if command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1; then
+    bind_ssh_to_tailscale
+  else
+    warn "Tailscale not connected — run 'sudo tailscale up --ssh' manually, then re-run 'fix'."
+  fi
+
+  echo ""
+  run_healthcheck
+}
+
+run() {
+  case "${1:-}" in
+    ""|wizard) main ;;
+    doctor) run_doctor ;;
+    fix) run_fix ;;
+    *) error "Unknown command: '$1' (expected: doctor, fix, or no argument to run the wizard)"; exit 1 ;;
+  esac
+}
+
+[[ "${BASH_SOURCE[0]}" == "$0" ]] && run "$@"
