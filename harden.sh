@@ -81,13 +81,22 @@ run_wizard() {
   echo -e "  ${BLUE}Tip: Generate an auth key at https://login.tailscale.com/admin/settings/keys${NC}"
   TS_AUTHKEY="$(ask "Tailscale auth key (leave empty to authenticate manually)" "")"
 
-  OPEN_PORTS="$(ask "TCP ports to open publicly" "80 443")"
-
-  if ask_yn "Restrict public TCP ports to Cloudflare IPs only?" "n"; then
-    CLOUDFLARE_ONLY="yes"
+  echo -e "  ${BLUE}Tailscale node keys expire by default (~180 days). Since SSH here is${NC}"
+  echo -e "  ${BLUE}Tailscale-only, an expired key disconnects the device and locks you out${NC}"
+  echo -e "  ${BLUE}of SSH with no fallback. Disabling expiry removes that risk, at the${NC}"
+  echo -e "  ${BLUE}cost of a leaked auth key staying valid until you revoke it by hand.${NC}"
+  if ask_yn "Disable Tailscale key expiry for this device?" "y"; then
+    DISABLE_KEY_EXPIRY="yes"
+    TS_API_TOKEN="$(ask "Tailscale API access token (admin console > Settings > Keys; leave empty to disable manually later)" "")"
   else
-    CLOUDFLARE_ONLY="no"
+    DISABLE_KEY_EXPIRY="no"
+    TS_API_TOKEN=""
   fi
+
+  echo -e "  ${BLUE}Public ingress is Cloudflare Tunnel only — no port 80/443 is opened on${NC}"
+  echo -e "  ${BLUE}this box. Create a tunnel + Public Hostname route at${NC}"
+  echo -e "  ${BLUE}https://one.dash.cloudflare.com/ > Networks > Tunnels, then paste its token.${NC}"
+  CF_TUNNEL_TOKEN="$(ask "Cloudflare Tunnel token (leave empty to configure manually later)" "")"
 }
 
 # --- Summary ------------------------------------------------------------------
@@ -101,13 +110,22 @@ show_summary() {
   else
     info "Tailscale auth:      manual (you'll run 'tailscale up --ssh' after)"
   fi
-  info "Fail2ban:            removed if installed (redundant behind Tailscale)"
-  if [[ "$CLOUDFLARE_ONLY" == "yes" ]]; then
-    info "Public TCP ports:    ${OPEN_PORTS} (restricted to Cloudflare IP ranges)"
+  if [[ "$DISABLE_KEY_EXPIRY" == "yes" ]]; then
+    if [[ -n "$TS_API_TOKEN" ]]; then
+      info "Tailscale key expiry: disabled via API"
+    else
+      info "Tailscale key expiry: disable manually (no API token given)"
+    fi
   else
-    info "Public TCP ports:    ${OPEN_PORTS} (open to the internet)"
+    info "Tailscale key expiry: left at default (~180 days)"
   fi
-  info "Firewall:            UFW (deny incoming, allow outgoing)"
+  info "Fail2ban:            removed if installed (redundant behind Tailscale)"
+  if [[ -n "$CF_TUNNEL_TOKEN" ]]; then
+    info "Public ingress:      Cloudflare Tunnel (no listening port)"
+  else
+    info "Public ingress:      none configured (add a tunnel token and re-run)"
+  fi
+  info "Firewall:            UFW (deny incoming, allow outgoing; no public ports)"
   info "Unattended upgrades: enabled (auto-reboot 03:30)"
   info "Sysctl hardening:    enabled"
   echo ""
@@ -170,7 +188,7 @@ setup_packages() {
 
   apt-get -y full-upgrade || true
 
-  apt-get -y install ufw unattended-upgrades systemd-timesyncd
+  apt-get -y install ufw unattended-upgrades systemd-timesyncd jq
 
   success "Packages installed."
 }
@@ -272,76 +290,78 @@ EOF
 }
 
 # --- Module: UFW --------------------------------------------------------------
-# Fetches Cloudflare's published IP ranges. Sources:
-#   https://www.cloudflare.com/ips-v4
-#   https://www.cloudflare.com/ips-v6
-# These are the canonical endpoints documented at https://www.cloudflare.com/ips/.
-# Plain text, one CIDR per line.
-#
-# Fails loud if the endpoint is unreachable, returns non-200, or returns
-# anything that doesn't look like CIDR blocks. We never apply garbage to
-# UFW — better to leave the firewall untouched than to enable it with
-# rules that would lock everyone out.
-fetch_cloudflare_ranges() {
-  local v4 v6 cidr_re='^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$|^[0-9a-fA-F:]+/[0-9]{1,3}$'
-
-  v4="$(curl --fail --silent --show-error --max-time 10 https://www.cloudflare.com/ips-v4)" \
-    || { error "Could not fetch https://www.cloudflare.com/ips-v4"; return 1; }
-  v6="$(curl --fail --silent --show-error --max-time 10 https://www.cloudflare.com/ips-v6)" \
-    || { error "Could not fetch https://www.cloudflare.com/ips-v6"; return 1; }
-
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    [[ "$line" =~ $cidr_re ]] || { error "Unexpected response from ips-v4 (not a CIDR): $line"; return 1; }
-  done <<< "$v4"
-
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    [[ "$line" =~ $cidr_re ]] || { error "Unexpected response from ips-v6 (not a CIDR): $line"; return 1; }
-  done <<< "$v6"
-
-  CF_V4_RANGES="$v4"
-  CF_V6_RANGES="$v6"
-}
-
+# No public TCP ports at all — public ingress is Cloudflare Tunnel, which is
+# an outbound-only connection from this box, so it needs no inbound allow
+# rule. Only Tailscale-sourced SSH is ever allowed in.
 setup_ufw() {
   info "Configuring UFW..."
-
-  # Pre-flight: if the operator chose Cloudflare-only, pull the ranges
-  # BEFORE we reset existing rules. A failure here leaves the firewall
-  # untouched instead of half-applied.
-  if [[ "$CLOUDFLARE_ONLY" == "yes" ]]; then
-    fetch_cloudflare_ranges || { error "Cloudflare-only mode aborted; firewall unchanged."; return 1; }
-  fi
 
   ufw --force reset
   ufw default deny incoming
   ufw default allow outgoing
-
-  for port in $OPEN_PORTS; do
-    if [[ "$CLOUDFLARE_ONLY" == "yes" ]]; then
-      while IFS= read -r cidr; do
-        [[ -z "$cidr" ]] && continue
-        ufw allow from "$cidr" to any port "$port" proto tcp comment "cloudflare-v4"
-      done <<< "$CF_V4_RANGES"
-      while IFS= read -r cidr; do
-        [[ -z "$cidr" ]] && continue
-        ufw allow from "$cidr" to any port "$port" proto tcp comment "cloudflare-v6"
-      done <<< "$CF_V6_RANGES"
-    else
-      ufw allow "${port}/tcp"
-    fi
-  done
-
   ufw allow in on tailscale0 to any port 22 proto tcp
-
   ufw --force enable
-  if [[ "$CLOUDFLARE_ONLY" == "yes" ]]; then
-    success "UFW configured (public ports restricted to Cloudflare ranges)."
-    warn "Cloudflare publishes new ranges occasionally. Re-run this wizard when the list at https://www.cloudflare.com/ips/ changes."
-  else
-    success "UFW configured."
+  success "UFW configured."
+}
+
+# --- Module: Cloudflare Tunnel -------------------------------------------------
+# Sole public-ingress path — no UFW allow rule needed since the tunnel is an
+# outbound-only connection from this box to Cloudflare's edge.
+#
+# Deliberately does NOT use `cloudflared service install <token>`: that
+# command bakes the raw token into the generated systemd unit's ExecStart
+# line, so it sits in plaintext in the unit file and stays visible in
+# `ps`/`/proc/<pid>/cmdline` for the life of the service. Instead we store
+# the token in a root-only file and point cloudflared at it with
+# --token-file (supported since cloudflared 2025.4.0), same file-based
+# secret pattern used for TS_AUTHKEY and the Tailscale API token above.
+setup_cloudflare_tunnel() {
+  if [[ -z "${CF_TUNNEL_TOKEN:-}" ]]; then
+    warn "No Cloudflare Tunnel token given — skipping. Add one and re-run this wizard to enable public ingress."
+    return 0
   fi
+
+  info "Installing Cloudflare Tunnel (cloudflared)..."
+
+  if ! command -v cloudflared >/dev/null 2>&1; then
+    local arch deb
+    arch="$(dpkg --print-architecture)"
+    deb="$(mktemp /tmp/cloudflared.XXXXXX.deb)"
+    curl --fail --silent --show-error --location \
+      -o "$deb" \
+      "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}.deb"
+    dpkg -i "$deb"
+    rm -f "$deb"
+  fi
+
+  local cloudflared_bin
+  cloudflared_bin="$(command -v cloudflared)"
+
+  install -d -m 700 -o root -g root /etc/cloudflared
+  printf '%s' "$CF_TUNNEL_TOKEN" > /etc/cloudflared/token
+  chmod 600 /etc/cloudflared/token
+  chown root:root /etc/cloudflared/token
+
+  write_if_changed /etc/systemd/system/cloudflared.service <<EOF
+[Unit]
+Description=Cloudflare Tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=${cloudflared_bin} --no-autoupdate tunnel run --token-file /etc/cloudflared/token
+Restart=on-failure
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  enable_service_now cloudflared.service
+  success "Cloudflare Tunnel running."
 }
 
 # --- Module: Fail2ban cleanup -------------------------------------------------
@@ -371,7 +391,14 @@ setup_tailscale() {
 
   if [[ -n "${TS_AUTHKEY:-}" ]]; then
     info "Authenticating Tailscale..."
-    tailscale up --authkey="$TS_AUTHKEY" --ssh
+    # Pass the key via file, not argv — CLI args are visible to any local
+    # user through `ps` / /proc/<pid>/cmdline for the life of the process.
+    local keyfile
+    keyfile="$(mktemp /tmp/ts-authkey.XXXXXX)"
+    chmod 600 "$keyfile"
+    printf '%s' "$TS_AUTHKEY" > "$keyfile"
+    tailscale up --authkey="file:${keyfile}" --ssh
+    shred -u "$keyfile" 2>/dev/null || rm -f "$keyfile"
     success "Tailscale connected."
   else
     success "Tailscale installed."
@@ -379,6 +406,50 @@ setup_tailscale() {
   fi
 
   bind_ssh_to_tailscale
+  disable_key_expiry
+}
+
+# Disables node key expiry via the Tailscale API so SSH (Tailscale-only)
+# can't be locked out by an unattended device silently disconnecting.
+# Requires the device to already be connected (to read its ID) and an
+# API access token (separate from the auth key) supplied in the wizard.
+disable_key_expiry() {
+  [[ "${DISABLE_KEY_EXPIRY:-no}" == "yes" ]] || return 0
+
+  if [[ -z "${TS_API_TOKEN:-}" ]]; then
+    warn "No API token given — disable key expiry manually: admin console > Machines > '...' > Disable key expiry."
+    return 0
+  fi
+
+  local device_id
+  device_id="$(tailscale status --json 2>/dev/null | jq -r '.Self.ID // empty')"
+  if [[ -z "$device_id" ]]; then
+    warn "Tailscale not connected yet — can't disable key expiry. Re-run this script after 'tailscale up --ssh'."
+    return 0
+  fi
+
+  info "Disabling Tailscale key expiry via API..."
+
+  # Token goes in a netrc file, not a curl argv flag — same reasoning as
+  # the auth key: argv is visible to any local user via ps/proc.
+  local netrc
+  netrc="$(mktemp /tmp/ts-netrc.XXXXXX)"
+  chmod 600 "$netrc"
+  printf 'machine api.tailscale.com\nlogin %s\npassword\n' "$TS_API_TOKEN" > "$netrc"
+
+  local ok=0
+  curl --fail --silent --show-error --netrc-file "$netrc" -X POST \
+    -H "Content-Type: application/json" \
+    --data '{"keyExpiryDisabled": true}' \
+    "https://api.tailscale.com/api/v2/device/${device_id}/key" >/dev/null || ok=1
+
+  shred -u "$netrc" 2>/dev/null || rm -f "$netrc"
+
+  if [[ $ok -eq 0 ]]; then
+    success "Key expiry disabled for this device."
+  else
+    error "Failed to disable key expiry via API — do it manually via the admin console."
+  fi
 }
 
 # Bind sshd to the Tailscale IP (defense-in-depth on top of the UFW
@@ -463,9 +534,6 @@ run_healthcheck() {
 
   # UFW
   check "UFW active" "ufw status | grep -q 'Status: active'"
-  if [[ "$CLOUDFLARE_ONLY" == "yes" ]]; then
-    check "UFW has Cloudflare allow rules" "ufw status | grep -q cloudflare-v4"
-  fi
 
   # Admin user
   check "Admin user '${ADMIN_USER}' exists" "id '$ADMIN_USER'"
@@ -491,11 +559,32 @@ run_healthcheck() {
     else
       warn "Tailscale IP not assigned yet (run 'sudo tailscale up --ssh')"
     fi
+
+    if [[ "${DISABLE_KEY_EXPIRY:-no}" == "yes" && -n "${TS_API_TOKEN:-}" ]]; then
+      local device_id netrc expiry_disabled
+      device_id="$(tailscale status --json 2>/dev/null | jq -r '.Self.ID // empty')"
+      if [[ -n "$device_id" ]]; then
+        netrc="$(mktemp /tmp/ts-netrc.XXXXXX)"
+        chmod 600 "$netrc"
+        printf 'machine api.tailscale.com\nlogin %s\npassword\n' "$TS_API_TOKEN" > "$netrc"
+        expiry_disabled="$(curl --fail --silent --netrc-file "$netrc" \
+          "https://api.tailscale.com/api/v2/device/${device_id}" 2>/dev/null \
+          | jq -r '.keyExpiryDisabled // false')"
+        shred -u "$netrc" 2>/dev/null || rm -f "$netrc"
+        check "Tailscale key expiry disabled" "[[ '$expiry_disabled' == 'true' ]]"
+      fi
+    fi
   else
     warn "Tailscale not connected yet (run 'sudo tailscale up --ssh')"
   fi
   check "UFW allows SSH on tailscale0" "ufw status | grep -q tailscale0"
   check "Fail2ban not installed" "! dpkg -l fail2ban 2>/dev/null | grep -q '^ii'"
+
+  # Cloudflare Tunnel
+  if [[ -n "${CF_TUNNEL_TOKEN:-}" ]]; then
+    check "cloudflared installed" "command -v cloudflared"
+    check "Cloudflare Tunnel service active" "systemctl is-active --quiet cloudflared"
+  fi
 
   echo -e "\n${BOLD}Results: ${GREEN}${passed} passed${NC}, ${RED}${failed} failed${NC}\n"
 
@@ -518,6 +607,7 @@ main() {
   setup_sysctl
   setup_ssh
   setup_ufw
+  setup_cloudflare_tunnel
   cleanup_fail2ban
   setup_tailscale
 
