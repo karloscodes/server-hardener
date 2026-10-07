@@ -24,7 +24,8 @@ The wizard asks a handful of questions, shows a summary of changes, and asks for
 
 ### Network
 
-- Tailscale installed, optionally auto-authenticated with an auth key
+- Tailscale installed and connected **before** public SSH closes: with an auth key, or with a login link the script shows and waits for. If it does not connect, the script stops and changes neither SSH nor the firewall
+- Plain OpenSSH on the tailnet, never Tailscale SSH (`tailscale up --ssh`): Tailscale SSH takes port 22 over from the hardened sshd and asks for a browser login, which breaks scripts and deploys. The health check fails when it is on (`sudo tailscale set --ssh=false` turns it off)
 - SSH restricted to the `tailscale0` interface — **not reachable from the public internet**
 - UFW: deny incoming, allow outgoing — public ports are always **restricted to Cloudflare's IP ranges**, not opened to the whole internet. The same HTTP/S ports are also allowed on `tailscale0`, so the box stays reachable over the tailnet when an ISP blackholes Cloudflare anycast (La Liga / Spain).
 - Fail2ban is **removed if present** — redundant on tailnet-only SSH and risks self-lockout
@@ -38,14 +39,14 @@ The wizard asks a handful of questions, shows a summary of changes, and asks for
 
 > **Operational note:** the Tailscale account is the single point of failure for SSH access to every box. Enable 2FA on the Tailscale account and review your tailnet ACLs to ensure only the right devices can reach `port:22`.
 >
-> **Key expiry:** Tailscale node keys expire by default (~180 days). Since SSH is Tailscale-only, an expired key disconnects the box and locks you out with no fallback. The wizard offers to disable expiry for you (needs an API access token); if you skip that, disable it manually per-device in the admin console, or re-authenticate (`sudo tailscale up --ssh`) before it lapses. Either way, keep your VPS provider's out-of-band console (serial/VNC) enabled as a break-glass path — Tailscale being the sole SSH route means it's also the sole recovery route if something goes wrong with it.
+> **Key expiry:** Tailscale node keys expire by default (~180 days). Since SSH is Tailscale-only, an expired key disconnects the box and locks you out with no fallback. The wizard offers to disable expiry for you (needs an API access token); if you skip that, disable it manually per-device in the admin console, or re-authenticate (`sudo tailscale up`) before it lapses. Either way, keep your VPS provider's out-of-band console (serial/VNC) enabled as a break-glass path — Tailscale being the sole SSH route means it's also the sole recovery route if something goes wrong with it.
 
 ## Wizard
 
 | Question | Default | Notes |
 |----------|---------|-------|
 | Admin username | `ubuntu` | Created if missing, seeded with root's SSH keys |
-| Tailscale auth key | empty | Optional — generate at [Tailscale admin](https://login.tailscale.com/admin/settings/keys). If empty, run `sudo tailscale up --ssh` after the script finishes. |
+| Tailscale auth key | empty | Optional — generate at [Tailscale admin](https://login.tailscale.com/admin/settings/keys). If empty, the script prints a login link and waits up to 10 minutes (`TS_UP_TIMEOUT`) for you to approve the server. |
 | Disable Tailscale key expiry? | yes | Avoids SSH lockout when the node key would otherwise expire. Needs an API access token to apply automatically — leave the token empty to disable it manually later instead. |
 | TCP ports to open | `80 443` | Public-facing ports — always locked to Cloudflare's [published IP ranges](https://www.cloudflare.com/ips/), including at the Docker/iptables layer if Docker is present |
 

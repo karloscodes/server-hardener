@@ -87,6 +87,9 @@ detect_open_ports() {
 
 KEY_EXPIRY_MARKER="/etc/server-hardener/key-expiry-disabled"
 
+# How long the wizard waits for the Tailscale login link to be approved.
+TS_UP_TIMEOUT="${TS_UP_TIMEOUT:-600}"
+
 # --- Wizard -------------------------------------------------------------------
 run_wizard() {
   echo -e "\n${BOLD}=== Server Hardener ===${NC}\n"
@@ -99,7 +102,7 @@ run_wizard() {
     TS_AUTHKEY=""
   else
     echo -e "  ${BLUE}Tip: Generate an auth key at https://login.tailscale.com/admin/settings/keys${NC}"
-    TS_AUTHKEY="$(ask "Tailscale auth key (leave empty to authenticate manually)" "")"
+    TS_AUTHKEY="$(ask "Tailscale auth key (leave empty to get a login link while the script runs)" "")"
   fi
 
   if [[ -f "$KEY_EXPIRY_MARKER" ]]; then
@@ -135,7 +138,7 @@ show_summary() {
   elif tailscale status >/dev/null 2>&1; then
     info "Tailscale auth:      already connected"
   else
-    info "Tailscale auth:      manual (you'll run 'tailscale up --ssh' after)"
+    info "Tailscale auth:      a login link, shown while the script runs"
   fi
   if [[ "$DISABLE_KEY_EXPIRY" == "already" ]]; then
     info "Tailscale key expiry: already disabled"
@@ -516,6 +519,12 @@ cleanup_fail2ban() {
 }
 
 # --- Module: Tailscale --------------------------------------------------------
+# Connects Tailscale. main runs this before it closes public SSH: afterwards
+# SSH is tailnet-only, so a box that is not on the tailnet would lock
+# everyone out. Plain `tailscale up`, never `--ssh`: Tailscale SSH takes over
+# port 22 on the tailnet, bypasses the hardened OpenSSH below (AllowUsers,
+# keys only), and its default "check" policy asks for a browser login, which
+# breaks scripts and deploys.
 setup_tailscale() {
   info "Installing Tailscale..."
 
@@ -523,24 +532,29 @@ setup_tailscale() {
     curl -fsSL https://tailscale.com/install.sh | sh
   fi
 
-  if [[ -n "${TS_AUTHKEY:-}" ]]; then
-    info "Authenticating Tailscale..."
-    # Pass the key via file, not argv — CLI args are visible to any local
-    # user through `ps` / /proc/<pid>/cmdline for the life of the process.
-    local keyfile
-    keyfile="$(mktemp /tmp/ts-authkey.XXXXXX)"
-    chmod 600 "$keyfile"
-    printf '%s' "$TS_AUTHKEY" > "$keyfile"
-    tailscale up --authkey="file:${keyfile}" --ssh
-    shred -u "$keyfile" 2>/dev/null || rm -f "$keyfile"
-    success "Tailscale connected."
-  else
-    success "Tailscale installed."
-    warn "Run 'sudo tailscale up --ssh' to authenticate."
+  if ! tailscale status >/dev/null 2>&1; then
+    if [[ -n "${TS_AUTHKEY:-}" ]]; then
+      info "Authenticating Tailscale..."
+      # Pass the key via file, not argv — CLI args are visible to any local
+      # user through `ps` / /proc/<pid>/cmdline for the life of the process.
+      local keyfile
+      keyfile="$(mktemp /tmp/ts-authkey.XXXXXX)"
+      chmod 600 "$keyfile"
+      printf '%s' "$TS_AUTHKEY" > "$keyfile"
+      tailscale up --reset --authkey="file:${keyfile}" || true
+      shred -u "$keyfile" 2>/dev/null || rm -f "$keyfile"
+    else
+      info "Open the link below to add this server to your tailnet. The script waits up to ${TS_UP_TIMEOUT}s."
+      timeout "$TS_UP_TIMEOUT" tailscale up --reset || true
+    fi
   fi
 
-  bind_ssh_to_tailscale
-  disable_key_expiry
+  if ! tailscale status >/dev/null 2>&1; then
+    error "Tailscale is not connected. SSH and the firewall stay as they are: closing public SSH now would lock you out."
+    error "Connect it with 'sudo tailscale up', then run this script again."
+    exit 1
+  fi
+  success "Tailscale connected."
 }
 
 # Disables node key expiry via the Tailscale API so SSH (Tailscale-only)
@@ -558,7 +572,7 @@ disable_key_expiry() {
   local device_id
   device_id="$(tailscale status --json 2>/dev/null | jq -r '.Self.ID // empty' || true)"
   if [[ -z "$device_id" ]]; then
-    warn "Tailscale not connected yet — can't disable key expiry. Re-run this script after 'tailscale up --ssh'."
+    warn "Tailscale not connected yet — can't disable key expiry. Re-run this script after 'sudo tailscale up'."
     return 0
   fi
 
@@ -601,7 +615,7 @@ bind_ssh_to_tailscale() {
   ts_ip="$(tailscale ip -4 2>/dev/null | head -1 || true)"
   if [[ -z "$ts_ip" ]]; then
     warn "Tailscale IP not yet assigned — skipping ListenAddress binding."
-    warn "After 'sudo tailscale up --ssh', re-run this script to apply."
+    warn "After 'sudo tailscale up', re-run this script to apply."
     return 0
   fi
 
@@ -702,14 +716,16 @@ run_healthcheck() {
       passed=$((passed + 1))
       check "sshd bound to Tailscale IP" "ss -tlnp | grep -q \"${ts_ip}:22\""
     else
-      warn "Tailscale IP not assigned yet (run 'sudo tailscale up --ssh')"
+      warn "Tailscale IP not assigned yet (run 'sudo tailscale up')"
     fi
 
     if [[ -f "$KEY_EXPIRY_MARKER" ]]; then
       check "Tailscale key expiry disabled" "true"
     fi
+    # Tailscale SSH would take port 22 over from the hardened OpenSSH.
+    check "Tailscale SSH off (if not: sudo tailscale set --ssh=false)" "[[ \"\$(tailscale debug prefs 2>/dev/null | jq -r .RunSSH)\" == false ]]"
   else
-    warn "Tailscale not connected yet (run 'sudo tailscale up --ssh')"
+    warn "Tailscale not connected yet (run 'sudo tailscale up')"
   fi
   check "UFW allows SSH on tailscale0" "ufw status | grep -q '22/tcp on tailscale0'"
   if [[ "$OPEN_PORTS" == *443* ]]; then
@@ -736,18 +752,17 @@ main() {
   setup_packages
   setup_unattended_upgrades
   setup_sysctl
-  setup_ssh
-  setup_ufw
   cleanup_fail2ban
   setup_tailscale
+  setup_ssh
+  setup_ufw
+  bind_ssh_to_tailscale
+  disable_key_expiry
 
   run_healthcheck
 
   echo -e "${BOLD}=== Done ===${NC}\n"
   info "Admin user: ${ADMIN_USER}"
-  if [[ -z "${TS_AUTHKEY:-}" ]] && ! tailscale status >/dev/null 2>&1; then
-    warn "Next step: sudo tailscale up --ssh"
-  fi
   echo -e "\n  Test: ${BOLD}ssh ${ADMIN_USER}@<tailscale-host>${NC}\n"
 }
 
@@ -782,13 +797,13 @@ run_fix() {
     warn "Could not detect admin user (no AllowUsers in sshd config) — skipping admin-user/SSH repair. Run the full wizard instead."
   fi
 
-  setup_ufw
   cleanup_fail2ban
 
   if command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1; then
+    setup_ufw
     bind_ssh_to_tailscale
   else
-    warn "Tailscale not connected — run 'sudo tailscale up --ssh' manually, then re-run 'fix'."
+    warn "Tailscale not connected — the firewall stays as it is, so public SSH is not closed. Run 'sudo tailscale up', then re-run 'fix'."
   fi
 
   echo ""

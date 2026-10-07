@@ -207,6 +207,26 @@ footguns="$(grep -nF '++))' "$HARDEN_SH" || true)"
 footguns+="$(grep -nF -- '--))' "$HARDEN_SH" || true)"
 assert_eq "no bare ((var++))/((var--)) arithmetic commands" "" "$footguns"
 
+# --- Static guard: lockout order -----------------------------------------
+# SSH is tailnet-only once setup_ufw runs, so main must connect Tailscale
+# first. With the old order, a box with no auth key ended up with public SSH
+# closed and no tailnet: reachable only from the provider's console.
+echo "lockout order guard"
+main_body="$(awk '/^main\(\) \{/,/^}/' "$HARDEN_SH")"
+line_of() { grep -n "^  $1\$" <<< "$main_body" | head -1 | cut -d: -f1; }
+ts_line="$(line_of setup_tailscale)"
+ssh_line="$(line_of setup_ssh)"
+ufw_line="$(line_of setup_ufw)"
+assert_eq "main runs setup_tailscale before setup_ssh" "yes" "$([[ -n "$ts_line" && -n "$ssh_line" && $ts_line -lt $ssh_line ]] && echo yes || echo no)"
+assert_eq "main runs setup_tailscale before setup_ufw" "yes" "$([[ -n "$ts_line" && -n "$ufw_line" && $ts_line -lt $ufw_line ]] && echo yes || echo no)"
+
+# --- Static guard: no Tailscale SSH ---------------------------------------
+# `tailscale up --ssh` turns on Tailscale SSH: it takes port 22 over from the
+# hardened OpenSSH and asks for a browser login, which breaks deploys.
+echo "Tailscale SSH guard"
+ts_ssh="$(grep -nE 'tailscale (up|set)\b.*--ssh\b' "$HARDEN_SH" | grep -vE '^[0-9]+:[[:space:]]*#' | grep -v -- '--ssh=false' || true)"
+assert_eq "no 'tailscale up --ssh' anywhere" "" "$ts_ssh"
+
 # --- Syntax ------------------------------------------------------------
 echo "syntax"
 if bash -n "$HARDEN_SH" 2>/dev/null; then
