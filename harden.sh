@@ -85,6 +85,28 @@ detect_open_ports() {
   ufw status 2>/dev/null | grep -v tailscale0 | grep -oP '^\d+(?=/tcp\b)' | grep -v '^22$' | sort -un | tr '\n' ' ' | sed 's/[[:space:]]*$//' || true
 }
 
+# The web ports (80, 443) that a process or a container listens on, on every
+# address. The wizard offers them, and the health check wants a Cloudflare
+# rule for each: a box once got "80" as its answer while its proxy listened
+# on 443, and nothing said so.
+detect_listening_web_ports() {
+  ss -Htln 2>/dev/null | awk '{print $4}' | grep -oE '^(0\.0\.0\.0|\[::\]|\*):(80|443)$' | grep -oE '[0-9]+$' | sort -un | tr '\n' ' ' | sed 's/[[:space:]]*$//' || true
+}
+
+# The ports the wizard and fix use: the ones UFW allows now, and the web
+# ports that something listens on.
+suggest_open_ports() {
+  echo "$(detect_open_ports) $(detect_listening_web_ports)" | tr ' ' '\n' | grep -v '^$' | sort -un | tr '\n' ' ' | sed 's/[[:space:]]*$//' || true
+}
+
+# "disabled", the date the node key of this device expires, or "" when it
+# cannot tell (not connected, or no jq yet). Tailscale itself knows: no API
+# token and no marker file needed.
+tailscale_key_expiry() {
+  command -v jq >/dev/null 2>&1 && tailscale status >/dev/null 2>&1 || return 0
+  tailscale status --json 2>/dev/null | jq -r 'if .Self.KeyExpiry then .Self.KeyExpiry else "disabled" end' 2>/dev/null || true
+}
+
 KEY_EXPIRY_MARKER="/etc/server-hardener/key-expiry-disabled"
 
 # How long the wizard waits for the Tailscale login link to be approved.
@@ -105,7 +127,7 @@ run_wizard() {
     TS_AUTHKEY="$(ask "Tailscale auth key (leave empty to get a login link while the script runs)" "")"
   fi
 
-  if [[ -f "$KEY_EXPIRY_MARKER" ]]; then
+  if [[ -f "$KEY_EXPIRY_MARKER" || "$(tailscale_key_expiry)" == "disabled" ]]; then
     info "Tailscale key expiry already disabled — skipping."
     DISABLE_KEY_EXPIRY="already"
     TS_API_TOKEN=""
@@ -123,8 +145,12 @@ run_wizard() {
     fi
   fi
 
-  OPEN_PORTS="$(ask "TCP ports to open publicly" "$(detect_open_ports)")"
+  OPEN_PORTS="$(ask "TCP ports to open publicly" "$(suggest_open_ports)")"
   [[ -n "$OPEN_PORTS" ]] || OPEN_PORTS="80 443"
+  local port
+  for port in $(detect_listening_web_ports); do
+    [[ " $OPEN_PORTS " == *" $port "* ]] || warn "Port ${port} has a listener on every address, and it is not in your list: it gets no Cloudflare rule."
+  done
 }
 
 # --- Summary ------------------------------------------------------------------
@@ -719,8 +745,12 @@ run_healthcheck() {
       warn "Tailscale IP not assigned yet (run 'sudo tailscale up')"
     fi
 
-    if [[ -f "$KEY_EXPIRY_MARKER" ]]; then
+    local expiry
+    expiry="$(tailscale_key_expiry)"
+    if [[ "$expiry" == "disabled" || -f "$KEY_EXPIRY_MARKER" ]]; then
       check "Tailscale key expiry disabled" "true"
+    elif [[ -n "$expiry" ]]; then
+      warn "Tailscale key expires ${expiry}: SSH stops then. Disable it: admin console > Machines > '...' > Disable key expiry."
     fi
     # Tailscale SSH would take port 22 over from the hardened OpenSSH.
     check "Tailscale SSH off (if not: sudo tailscale set --ssh=false)" "[[ \"\$(tailscale debug prefs 2>/dev/null | jq -r .RunSSH)\" == false ]]"
@@ -731,6 +761,10 @@ run_healthcheck() {
   if [[ "$OPEN_PORTS" == *443* ]]; then
     check "UFW allows HTTPS on tailscale0" "ufw status | grep -q '443/tcp on tailscale0'"
   fi
+  local port
+  for port in $(detect_listening_web_ports); do
+    check "Port ${port} listens and has its Cloudflare rule (if not: re-run the wizard with ${port} in the ports)" "[[ \" \$(detect_open_ports) \" == *\" ${port} \"* ]]"
+  done
   check "Fail2ban not installed" "! dpkg -l fail2ban 2>/dev/null | grep -q '^ii'"
 
   echo -e "\n${BOLD}Results: ${GREEN}${passed} passed${NC}, ${RED}${failed} failed${NC}\n"
@@ -763,7 +797,14 @@ main() {
 
   echo -e "${BOLD}=== Done ===${NC}\n"
   info "Admin user: ${ADMIN_USER}"
-  echo -e "\n  Test: ${BOLD}ssh ${ADMIN_USER}@<tailscale-host>${NC}\n"
+  local ts_name
+  ts_name="$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' 2>/dev/null | cut -d. -f1 || true)"
+  ts_name="${ts_name:-<tailscale-host>}"
+  echo -e "\n  SSH is OpenSSH on the tailnet, with keys only (Tailscale SSH stays off)."
+  echo -e "  Each computer that logs in needs its public key in ~${ADMIN_USER}/.ssh/authorized_keys."
+  echo -e "  Its ~/.ssh/config entry (IdentitiesOnly keeps an agent with many keys under MaxAuthTries 3):\n"
+  echo -e "    Host ${ts_name}\n      User ${ADMIN_USER}\n      IdentityFile ~/.ssh/<your key>\n      IdentitiesOnly yes\n"
+  echo -e "  Test: ${BOLD}ssh ${ts_name}${NC}\n"
 }
 
 # --- Doctor / Fix ---------------------------------------------------------------
@@ -782,7 +823,7 @@ run_doctor() {
 run_fix() {
   check_preconditions
   ADMIN_USER="$(detect_admin_user)"
-  OPEN_PORTS="$(detect_open_ports)"
+  OPEN_PORTS="$(suggest_open_ports)"
   [[ -n "$OPEN_PORTS" ]] || OPEN_PORTS="80 443"
 
   info "Re-applying self-contained hardening steps..."

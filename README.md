@@ -20,6 +20,7 @@ The wizard asks a handful of questions, shows a summary of changes, and asks for
 - `AllowUsers <admin>` — only the configured admin can SSH
 - `AuthenticationMethods publickey` — cannot be silently weakened by another drop-in
 - Root login disabled, password auth disabled
+- Each computer that logs in needs its own public key in the admin's `authorized_keys`: Tailscale SSH stays off, so the tailnet login alone does not get you in. At the end the script prints the `~/.ssh/config` entry for your computer, with `IdentitiesOnly yes`, so an agent with many keys stays under `MaxAuthTries 3`
 - sshd bound to the Tailscale IP (defense-in-depth on top of UFW)
 
 ### Network
@@ -35,11 +36,13 @@ The wizard asks a handful of questions, shows a summary of changes, and asks for
 
 - Kernel/network sysctl hardening
 - Unattended security upgrades with auto-reboot at 03:30
-- Health check at the end verifies everything
+- Health check at the end verifies everything, also:
+  - every web port (80, 443) that a process or a container listens on has its Cloudflare rule. A box once got `80` as its ports answer while its proxy listened on 443, and nothing said so
+  - the Tailscale key expiry, read from Tailscale itself: a warning with the date when the key will expire
 
 > **Operational note:** the Tailscale account is the single point of failure for SSH access to every box. Enable 2FA on the Tailscale account and review your tailnet ACLs to ensure only the right devices can reach `port:22`.
 >
-> **Key expiry:** Tailscale node keys expire by default (~180 days). Since SSH is Tailscale-only, an expired key disconnects the box and locks you out with no fallback. The wizard offers to disable expiry for you (needs an API access token); if you skip that, disable it manually per-device in the admin console, or re-authenticate (`sudo tailscale up`) before it lapses. Either way, keep your VPS provider's out-of-band console (serial/VNC) enabled as a break-glass path — Tailscale being the sole SSH route means it's also the sole recovery route if something goes wrong with it.
+> **Key expiry:** Tailscale node keys expire by default (~180 days). Since SSH is Tailscale-only, an expired key disconnects the box and locks you out with no fallback. The wizard offers to disable expiry for you (needs an API access token), and skips the question when Tailscale already reports it disabled; if you skip that, disable it manually per-device in the admin console, or re-authenticate (`sudo tailscale up`) before it lapses. Either way, keep your VPS provider's out-of-band console (serial/VNC) enabled as a break-glass path — Tailscale being the sole SSH route means it's also the sole recovery route if something goes wrong with it.
 
 ## Wizard
 
@@ -48,7 +51,7 @@ The wizard asks a handful of questions, shows a summary of changes, and asks for
 | Admin username | `ubuntu` | Created if missing, seeded with root's SSH keys |
 | Tailscale auth key | empty | Optional — generate at [Tailscale admin](https://login.tailscale.com/admin/settings/keys). If empty, the script prints a login link and waits up to 10 minutes (`TS_UP_TIMEOUT`) for you to approve the server. |
 | Disable Tailscale key expiry? | yes | Avoids SSH lockout when the node key would otherwise expire. Needs an API access token to apply automatically — leave the token empty to disable it manually later instead. |
-| TCP ports to open | `80 443` | Public-facing ports — always locked to Cloudflare's [published IP ranges](https://www.cloudflare.com/ips/), including at the Docker/iptables layer if Docker is present |
+| TCP ports to open | the ports UFW allows now, plus 80/443 when something listens on them; `80 443` on a new box | Public-facing ports. The wizard warns when you leave out a web port that something listens on — always locked to Cloudflare's [published IP ranges](https://www.cloudflare.com/ips/), including at the Docker/iptables layer if Docker is present |
 
 ## Re-running
 
@@ -67,7 +70,7 @@ sudo bash harden.sh doctor   # read-only health check, no prompts, no changes
 sudo bash harden.sh fix      # re-applies the self-contained hardening steps, then re-checks
 ```
 
-Both auto-detect the admin user (from the existing `AllowUsers` line) and open ports (from existing UFW rules) instead of asking. `fix` re-applies everything that doesn't need a new secret — UFW, sysctl, admin user/SSH, unattended upgrades, fail2ban cleanup, the Tailscale IP binding, and the Docker/UFW fix. Anything that genuinely needs a fresh secret (Tailscale auth key, API token) isn't touched — run the full wizard (`sudo bash harden.sh`) for those instead.
+Both auto-detect the admin user (from the existing `AllowUsers` line) and open ports (from existing UFW rules; `fix` adds 80/443 when something listens on them) instead of asking. `fix` re-applies everything that doesn't need a new secret — UFW, sysctl, admin user/SSH, unattended upgrades, fail2ban cleanup, the Tailscale IP binding, and the Docker/UFW fix. Anything that genuinely needs a fresh secret (Tailscale auth key, API token) isn't touched — run the full wizard (`sudo bash harden.sh`) for those instead.
 
 ## Testing
 

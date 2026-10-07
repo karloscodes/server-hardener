@@ -174,6 +174,56 @@ EOF
   unset -f ufw
 fi
 
+# --- detect_listening_web_ports / suggest_open_ports -----------------------
+echo "detect_listening_web_ports"
+# Stub ss with the local-address column the function reads (column 4).
+ss() {
+  case "$__TEST_SS_FIXTURE" in
+    proxy_on_both)
+      printf 'LISTEN 0 4096 0.0.0.0:80 0.0.0.0:*\nLISTEN 0 4096 [::]:443 [::]:*\nLISTEN 0 4096 0.0.0.0:443 0.0.0.0:*\nLISTEN 0 128 100.98.141.16:22 0.0.0.0:*\n' ;;
+    loopback_only)
+      printf 'LISTEN 0 4096 127.0.0.1:80 0.0.0.0:*\nLISTEN 0 4096 127.0.0.1:443 0.0.0.0:*\nLISTEN 0 4096 0.0.0.0:8080 0.0.0.0:*\n' ;;
+    nothing) ;;
+  esac
+}
+__TEST_SS_FIXTURE=proxy_on_both
+assert_eq "finds 80 and 443 on every address, once each" "80 443" "$(detect_listening_web_ports)"
+__TEST_SS_FIXTURE=loopback_only
+assert_eq "ignores loopback listeners and other ports" "" "$(detect_listening_web_ports)"
+__TEST_SS_FIXTURE=nothing
+assert_eq "empty when nothing listens" "" "$(detect_listening_web_ports)"
+
+# The gap it closes: UFW had only 80, while a proxy listened on 443.
+detect_open_ports() { echo "80"; }
+__TEST_SS_FIXTURE=proxy_on_both
+assert_eq "suggests the listening 443 next to the 80 that UFW has" "80 443" "$(suggest_open_ports)"
+unset -f ss detect_open_ports
+source "$HARDEN_SH" || true
+set +e
+
+# --- tailscale_key_expiry --------------------------------------------------
+echo "tailscale_key_expiry"
+if command -v jq >/dev/null 2>&1; then
+  tailscale() {
+    [[ "$1" == "status" ]] || return 1
+    [[ "$__TEST_TS" == "down" ]] && return 1
+    [[ "${2:-}" == "--json" ]] || return 0
+    case "$__TEST_TS" in
+      disabled) echo '{"Self":{"KeyExpiry":null}}' ;;
+      expires)  echo '{"Self":{"KeyExpiry":"2027-04-05T18:15:47Z"}}' ;;
+    esac
+  }
+  __TEST_TS=disabled
+  assert_eq "says disabled when the node key has no expiry" "disabled" "$(tailscale_key_expiry)"
+  __TEST_TS=expires
+  assert_eq "gives the date when the node key expires" "2027-04-05T18:15:47Z" "$(tailscale_key_expiry)"
+  __TEST_TS=down
+  assert_eq "empty when Tailscale is not connected (unknown, not 'disabled')" "" "$(tailscale_key_expiry)"
+  unset -f tailscale
+else
+  skip_test "tailscale_key_expiry (needs jq)"
+fi
+
 # --- Cloudflare CIDR validation (fetch_cloudflare_ranges's regex) ---------
 echo "Cloudflare CIDR regex"
 cidr_re='^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$|^[0-9a-fA-F:]+/[0-9]{1,3}$'
