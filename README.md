@@ -26,7 +26,7 @@ The wizard asks a handful of questions, shows a summary of changes, and asks for
 
 - Tailscale installed, optionally auto-authenticated with an auth key
 - SSH restricted to the `tailscale0` interface — **not reachable from the public internet**
-- UFW: deny incoming, allow outgoing — public ports are always **restricted to Cloudflare's IP ranges**, not opened to the whole internet
+- UFW: deny incoming, allow outgoing — public ports are always **restricted to Cloudflare's IP ranges**, not opened to the whole internet. The same HTTP/S ports are also allowed on `tailscale0`, so the box stays reachable over the tailnet when an ISP blackholes Cloudflare anycast (La Liga / Spain).
 - Fail2ban is **removed if present** — redundant on tailnet-only SSH and risks self-lockout
 - If Docker is present, also closes the [Docker/UFW bypass](https://github.com/chaifeng/ufw-docker) — Docker publishes container ports via its own iptables rules that ignore UFW entirely, so a container's `-p 80:80` can stay reachable from the whole internet even while `ufw status` reports traffic restricted to Cloudflare. This mirrors the same Cloudflare-IP allowlist at the `DOCKER-USER` chain, which Docker actually respects.
 

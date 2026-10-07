@@ -134,6 +134,8 @@ To                         Action      From
 80/tcp                     ALLOW       173.245.48.0/20
 443/tcp                    ALLOW       173.245.48.0/20
 22/tcp on tailscale0       ALLOW       Anywhere
+80/tcp on tailscale0       ALLOW       Anywhere
+443/tcp on tailscale0      ALLOW       Anywhere
 EOF
         ;;
       ssh_wrongly_open)

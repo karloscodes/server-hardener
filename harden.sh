@@ -149,7 +149,7 @@ show_summary() {
     info "Tailscale key expiry: left at default (~180 days)"
   fi
   info "Fail2ban:            removed if installed (redundant behind Tailscale)"
-  info "Public TCP ports:    ${OPEN_PORTS} (restricted to Cloudflare IP ranges)"
+  info "Public TCP ports:    ${OPEN_PORTS} (Cloudflare on the internet, also on tailscale0)"
   info "Firewall:            UFW (deny incoming, allow outgoing)"
   info "Unattended upgrades: enabled (auto-reboot 03:30)"
   info "Sysctl hardening:    enabled"
@@ -371,9 +371,14 @@ setup_ufw() {
   done
 
   ufw allow in on tailscale0 to any port 22 proto tcp
+  # Same ports as public HTTP(S), but on the tailnet — so a box stays
+  # reachable when an ISP blackholes Cloudflare anycast (La Liga / Spain).
+  for port in $OPEN_PORTS; do
+    ufw allow in on tailscale0 to any port "$port" proto tcp comment "tailscale-ingress"
+  done
 
   ufw --force enable
-  success "UFW configured (public ports restricted to Cloudflare ranges)."
+  success "UFW configured (public ports restricted to Cloudflare ranges; HTTP/S also on tailscale0)."
   warn "Cloudflare publishes new ranges occasionally. Re-run this wizard when the list at https://www.cloudflare.com/ips/ changes."
 
   harden_docker_forwarding
@@ -706,7 +711,10 @@ run_healthcheck() {
   else
     warn "Tailscale not connected yet (run 'sudo tailscale up --ssh')"
   fi
-  check "UFW allows SSH on tailscale0" "ufw status | grep -q tailscale0"
+  check "UFW allows SSH on tailscale0" "ufw status | grep -q '22/tcp on tailscale0'"
+  if [[ "$OPEN_PORTS" == *443* ]]; then
+    check "UFW allows HTTPS on tailscale0" "ufw status | grep -q '443/tcp on tailscale0'"
+  fi
   check "Fail2ban not installed" "! dpkg -l fail2ban 2>/dev/null | grep -q '^ii'"
 
   echo -e "\n${BOLD}Results: ${GREEN}${passed} passed${NC}, ${RED}${failed} failed${NC}\n"
