@@ -351,11 +351,12 @@ EOF
 # Plain text, one CIDR per line.
 #
 # Fails loud if the endpoint is unreachable, returns non-200, or returns
-# anything that doesn't look like CIDR blocks. We never apply garbage to
-# UFW — better to leave the firewall untouched than to enable it with
-# rules that would lock everyone out.
+# anything that doesn't look like CIDR blocks, or no block at all. We never
+# apply garbage to UFW — better to leave the firewall untouched than to
+# enable it with rules that would lock everyone out. An empty list is that
+# case too: the web ports would stay closed to every visitor.
 fetch_cloudflare_ranges() {
-  local v4 v6 cidr_re='^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$|^[0-9a-fA-F:]+/[0-9]{1,3}$'
+  local v4 v6 n4=0 n6=0 cidr_re='^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$|^[0-9a-fA-F:]+/[0-9]{1,3}$'
 
   v4="$(curl --fail --silent --show-error --max-time 10 https://www.cloudflare.com/ips-v4)" \
     || { error "Could not fetch https://www.cloudflare.com/ips-v4"; return 1; }
@@ -365,15 +366,46 @@ fetch_cloudflare_ranges() {
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     [[ "$line" =~ $cidr_re ]] || { error "Unexpected response from ips-v4 (not a CIDR): $line"; return 1; }
+    n4=$((n4 + 1))
   done <<< "$v4"
 
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     [[ "$line" =~ $cidr_re ]] || { error "Unexpected response from ips-v6 (not a CIDR): $line"; return 1; }
+    n6=$((n6 + 1))
   done <<< "$v6"
+
+  [[ $n4 -gt 0 && $n6 -gt 0 ]] || { error "Cloudflare returned an empty list of ranges"; return 1; }
 
   CF_V4_RANGES="$v4"
   CF_V6_RANGES="$v6"
+}
+
+# The ranges fetch_cloudflare_ranges got, one per line, once each, sorted.
+fetched_cloudflare_ranges() {
+  printf '%s\n%s\n' "$CF_V4_RANGES" "$CF_V6_RANGES" | grep -v '^$' | sort -u || true
+}
+
+# The Cloudflare rules UFW has now, one "port range" per line, sorted:
+# "443 173.245.48.0/20". setup_ufw marks each of its rules with the comment
+# cloudflare-v4 or cloudflare-v6. Port and range together, because each
+# range has a rule on every port: a range missing on one port only is a gap.
+applied_cloudflare_rules() {
+  ufw status 2>/dev/null | awk '/# cloudflare-v[46]$/ { split($1, port, "/"); print port[1], $3 }' | sort -u || true
+}
+
+# The rules UFW should have: each fetched range on each of the given ports.
+wanted_cloudflare_rules() {
+  local port
+  for port in $1; do
+    fetched_cloudflare_ranges | sed "s#^#${port} #"
+  done | sort -u || true
+}
+
+# True when UFW has a rule for each range Cloudflare publishes today, on
+# each of its Cloudflare ports, and no other Cloudflare rule.
+cloudflare_ranges_current() {
+  fetch_cloudflare_ranges && [[ "$(wanted_cloudflare_rules "$(detect_open_ports)")" == "$(applied_cloudflare_rules)" ]]
 }
 
 setup_ufw() {
@@ -408,9 +440,54 @@ setup_ufw() {
 
   ufw --force enable
   success "UFW configured (public ports restricted to Cloudflare ranges; HTTP/S also on tailscale0)."
-  warn "Cloudflare publishes new ranges occasionally. Re-run this wizard when the list at https://www.cloudflare.com/ips/ changes."
+  info "Cloudflare publishes new ranges now and then. The weekly ${CF_REFRESH_UNIT}.timer applies them."
 
   harden_docker_forwarding
+}
+
+# --- Module: Cloudflare refresh -------------------------------------------------
+# A stale list drops the visitors who come through Cloudflare's new edges,
+# so a weekly timer runs refresh-cloudflare. The timer runs an installed
+# copy of this script, because the copy in /tmp is gone after a reboot.
+CF_REFRESH_BIN=/usr/local/sbin/server-hardener
+CF_REFRESH_UNIT=server-hardener-cloudflare
+
+setup_cloudflare_refresh() {
+  info "Installing the weekly refresh of Cloudflare's ranges..."
+
+  local self
+  self="$(readlink -f "${BASH_SOURCE[0]}")"
+  [[ "$self" == "$CF_REFRESH_BIN" ]] || install -m 755 -o root -g root "$self" "$CF_REFRESH_BIN"
+
+  write_if_changed "/etc/systemd/system/${CF_REFRESH_UNIT}.service" <<EOF
+[Unit]
+Description=Apply Cloudflare's current ranges to UFW (server-hardener)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${CF_REFRESH_BIN} refresh-cloudflare
+EOF
+
+  # Monday morning, after the 04:30 reboot of unattended upgrades.
+  # Persistent runs a missed week at the next boot.
+  write_if_changed "/etc/systemd/system/${CF_REFRESH_UNIT}.timer" <<EOF
+[Unit]
+Description=Weekly refresh of Cloudflare's ranges in UFW (server-hardener)
+
+[Timer]
+OnCalendar=Mon 05:00
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  enable_service_now "${CF_REFRESH_UNIT}.timer"
+  success "Cloudflare's ranges refresh every Monday (${CF_REFRESH_UNIT}.timer)."
 }
 
 # Docker manipulates iptables directly to publish container ports, inserting
@@ -711,6 +788,9 @@ run_healthcheck() {
   # UFW
   check "UFW active" "ufw status | grep -q 'Status: active'"
   check "UFW has Cloudflare allow rules" "ufw status | grep -q cloudflare-v4"
+  check "UFW has Cloudflare's current ranges (if not: sudo ${CF_REFRESH_BIN} refresh-cloudflare)" "cloudflare_ranges_current"
+  check "Weekly Cloudflare refresh on (if not: sudo bash harden.sh fix)" "systemctl is-enabled --quiet ${CF_REFRESH_UNIT}.timer"
+  check "Last Cloudflare refresh worked (if not: journalctl -u ${CF_REFRESH_UNIT})" "[[ \"\$(systemctl show -p Result --value ${CF_REFRESH_UNIT}.service)\" == success ]]"
   if command -v docker >/dev/null 2>&1; then
     check "Docker/UFW bypass closed" "iptables -L DOCKER-USER -n 2>/dev/null | grep -qE 'DROP.*0\\.0\\.0\\.0/0'"
   fi
@@ -790,6 +870,7 @@ main() {
   setup_tailscale
   setup_ssh
   setup_ufw
+  setup_cloudflare_refresh
   bind_ssh_to_tailscale
   disable_key_expiry
 
@@ -842,6 +923,7 @@ run_fix() {
 
   if command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1; then
     setup_ufw
+    setup_cloudflare_refresh
     bind_ssh_to_tailscale
   else
     warn "Tailscale not connected — the firewall stays as it is, so public SSH is not closed. Run 'sudo tailscale up', then re-run 'fix'."
@@ -851,12 +933,33 @@ run_fix() {
   run_healthcheck
 }
 
+# refresh-cloudflare: what the weekly timer runs. setup_ufw resets UFW
+# first, which leaves the box open for a few seconds, so this applies the
+# firewall again only when Cloudflare's list differs from the rules UFW has.
+# A fetch that fails or looks wrong changes nothing, and a box with no
+# Cloudflare rules is left to the wizard.
+run_refresh_cloudflare() {
+  check_preconditions
+  OPEN_PORTS="$(detect_open_ports)"
+  [[ -n "$OPEN_PORTS" ]] || { error "UFW has no Cloudflare ports. Run the wizard. Firewall unchanged."; exit 1; }
+  fetch_cloudflare_ranges || { error "Firewall unchanged."; exit 1; }
+
+  if [[ "$(wanted_cloudflare_rules "$OPEN_PORTS")" == "$(applied_cloudflare_rules)" ]]; then
+    info "Cloudflare's ranges are unchanged."
+    return 0
+  fi
+
+  info "Cloudflare's ranges differ from the rules in UFW. Applying them on ports ${OPEN_PORTS}..."
+  setup_ufw
+}
+
 run() {
   case "${1:-}" in
     ""|wizard) main ;;
     doctor) run_doctor ;;
     fix) run_fix ;;
-    *) error "Unknown command: '$1' (expected: doctor, fix, or no argument to run the wizard)"; exit 1 ;;
+    refresh-cloudflare) run_refresh_cloudflare ;;
+    *) error "Unknown command: '$1' (expected: doctor, fix, refresh-cloudflare, or no argument to run the wizard)"; exit 1 ;;
   esac
 }
 

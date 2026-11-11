@@ -31,14 +31,16 @@ The wizard asks a handful of questions, shows a summary of changes, and asks for
 - UFW: deny incoming, allow outgoing — public ports are always **restricted to Cloudflare's IP ranges**, not opened to the whole internet. The same HTTP/S ports are also allowed on `tailscale0`, so the box stays reachable over the tailnet when an ISP blackholes Cloudflare anycast (La Liga / Spain).
 - Fail2ban is **removed if present** — redundant on tailnet-only SSH and risks self-lockout
 - If Docker is present, also closes the [Docker/UFW bypass](https://github.com/chaifeng/ufw-docker) — Docker publishes container ports via its own iptables rules that ignore UFW entirely, so a container's `-p 80:80` can stay reachable from the whole internet even while `ufw status` reports traffic restricted to Cloudflare. This mirrors the same Cloudflare-IP allowlist at the `DOCKER-USER` chain, which Docker actually respects.
+- A weekly timer (`server-hardener-cloudflare.timer`, Monday after the reboot) fetches Cloudflare's ranges and applies them when they changed. A stale list would drop the visitors who come through Cloudflare's new edges. The refresh resets UFW only when the list differs, because a reset leaves the box open for a few seconds. A fetch that fails, returns no range, or returns anything that is not a range changes nothing. The timer runs a copy of the script in `/usr/local/sbin/server-hardener`, which each run of the wizard or `fix` updates.
 
 ### Box
 
 - Kernel/network sysctl hardening
-- Unattended security upgrades with auto-reboot at 03:30
+- Unattended security upgrades with auto-reboot at 04:30
 - Health check at the end verifies everything, also:
   - every web port (80, 443) that a process or a container listens on has its Cloudflare rule. A box once got `80` as its ports answer while its proxy listened on 443, and nothing said so
   - the Tailscale key expiry, read from Tailscale itself: a warning with the date when the key will expire
+  - UFW has the ranges Cloudflare publishes today, the weekly refresh is on, and its last run worked
 
 > **Operational note:** the Tailscale account is the single point of failure for SSH access to every box. Enable 2FA on the Tailscale account and review your tailnet ACLs to ensure only the right devices can reach `port:22`.
 >
@@ -58,7 +60,7 @@ The wizard asks a handful of questions, shows a summary of changes, and asks for
 The script is idempotent — re-run it anytime to:
 
 - Roll out new hardening defaults to existing servers
-- Refresh Cloudflare IP ranges in UFW (and the Docker/UFW bypass fix, if applicable)
+- Refresh Cloudflare IP ranges in UFW (and the Docker/UFW bypass fix, if applicable). The weekly timer does this by itself
 - Remove fail2ban from boxes hardened with an older version
 
 It also detects what's already configured and skips re-asking for it: the Tailscale auth key question is skipped if already connected, the key-expiry question is skipped if already disabled, and the admin username / public ports default to whatever's already configured instead of the stock defaults.
@@ -68,9 +70,10 @@ It also detects what's already configured and skips re-asking for it: the Tailsc
 ```bash
 sudo bash harden.sh doctor   # read-only health check, no prompts, no changes
 sudo bash harden.sh fix      # re-applies the self-contained hardening steps, then re-checks
+sudo server-hardener refresh-cloudflare   # what the weekly timer runs: applies Cloudflare's ranges when they changed
 ```
 
-Both auto-detect the admin user (from the existing `AllowUsers` line) and open ports (from existing UFW rules; `fix` adds 80/443 when something listens on them) instead of asking. `fix` re-applies everything that doesn't need a new secret — UFW, sysctl, admin user/SSH, unattended upgrades, fail2ban cleanup, the Tailscale IP binding, and the Docker/UFW fix. Anything that genuinely needs a fresh secret (Tailscale auth key, API token) isn't touched — run the full wizard (`sudo bash harden.sh`) for those instead.
+Both auto-detect the admin user (from the existing `AllowUsers` line) and open ports (from existing UFW rules; `fix` adds 80/443 when something listens on them) instead of asking. `fix` re-applies everything that doesn't need a new secret — UFW, sysctl, admin user/SSH, unattended upgrades, fail2ban cleanup, the Tailscale IP binding, the Docker/UFW fix, and the weekly Cloudflare refresh. Anything that genuinely needs a fresh secret (Tailscale auth key, API token) isn't touched — run the full wizard (`sudo bash harden.sh`) for those instead.
 
 ## Testing
 

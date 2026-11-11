@@ -234,6 +234,96 @@ assert_no_match "rejects HTML (fetch endpoint returning an error page)" "$cidr_r
 assert_no_match "rejects empty-ish garbage" "$cidr_re" "not-a-cidr"
 assert_no_match "rejects a bare IP with no prefix" "$cidr_re" "173.245.48.0"
 
+# --- applied_cloudflare_rules -----------------------------------------------
+echo "applied_cloudflare_rules"
+ufw() {
+  case "$__TEST_UFW_FIXTURE" in
+    cloudflare_restricted)
+      cat <<'EOF'
+Status: active
+
+To                         Action      From
+--                         ------      ----
+80/tcp                     ALLOW       173.245.48.0/20            # cloudflare-v4
+443/tcp                    ALLOW       173.245.48.0/20            # cloudflare-v4
+80/tcp                     ALLOW       2400:cb00::/32             # cloudflare-v6
+443/tcp                    ALLOW       2400:cb00::/32             # cloudflare-v6
+22/tcp on tailscale0       ALLOW       Anywhere
+443/tcp on tailscale0      ALLOW       Anywhere                   # tailscale-ingress
+443/tcp (v6) on tailscale0 ALLOW       Anywhere (v6)              # tailscale-ingress
+EOF
+      ;;
+    no_cloudflare)
+      printf 'Status: active\n\nTo Action From\n22/tcp on tailscale0 ALLOW Anywhere\n' ;;
+    inactive)
+      echo "Status: inactive" ;;
+  esac
+}
+__TEST_UFW_FIXTURE=cloudflare_restricted
+assert_eq "reads each port and range, v4 and v6, sorted" "$(printf '443 173.245.48.0/20\n443 2400:cb00::/32\n80 173.245.48.0/20\n80 2400:cb00::/32')" "$(applied_cloudflare_rules)"
+__TEST_UFW_FIXTURE=no_cloudflare
+assert_eq "empty when UFW has no Cloudflare rules" "" "$(applied_cloudflare_rules)"
+__TEST_UFW_FIXTURE=inactive
+assert_eq "empty when UFW is off" "" "$(applied_cloudflare_rules)"
+unset -f ufw
+
+# --- fetch_cloudflare_ranges --------------------------------------------------
+echo "fetch_cloudflare_ranges"
+# Stub curl with what each endpoint returns in a case.
+curl() {
+  local url="${*: -1}"
+  case "$__TEST_CF:$url" in
+    good:*ips-v4) printf '173.245.48.0/20\n103.21.244.0/22\n' ;;
+    good:*ips-v6) printf '2400:cb00::/32\n' ;;
+    empty_v4:*ips-v4) printf '\n' ;;
+    empty_v4:*ips-v6) printf '2400:cb00::/32\n' ;;
+    html:*) printf '<html>error</html>\n' ;;
+    down:*) return 22 ;;
+  esac
+}
+__TEST_CF=good
+assert_eq "accepts Cloudflare's lists" "0" "$(fetch_cloudflare_ranges >/dev/null; echo $?)"
+fetch_cloudflare_ranges >/dev/null
+assert_eq "gives the fetched ranges once each, sorted" "$(printf '103.21.244.0/22\n173.245.48.0/20\n2400:cb00::/32')" "$(fetched_cloudflare_ranges)"
+__TEST_CF=empty_v4
+assert_eq "refuses an empty list, which would close the web ports to everyone" "1" "$(fetch_cloudflare_ranges >/dev/null; echo $?)"
+__TEST_CF=html
+assert_eq "refuses a page that is not a list of ranges" "1" "$(fetch_cloudflare_ranges >/dev/null; echo $?)"
+__TEST_CF=down
+assert_eq "fails when Cloudflare does not answer" "1" "$(fetch_cloudflare_ranges >/dev/null; echo $?)"
+
+__TEST_CF=good
+fetch_cloudflare_ranges >/dev/null
+assert_eq "wants each range on each port" "$(printf '443 103.21.244.0/22\n443 173.245.48.0/20\n443 2400:cb00::/32\n80 103.21.244.0/22\n80 173.245.48.0/20\n80 2400:cb00::/32')" "$(wanted_cloudflare_rules "80 443")"
+unset -f curl
+
+# --- run_refresh_cloudflare ---------------------------------------------------
+echo "run_refresh_cloudflare"
+# setup_ufw resets UFW first, so the refresh may call it only when the list
+# changed. Each case runs in a subshell, since the refresh exits on an error.
+refresh_case() {
+  (
+    check_preconditions() { :; }
+    fetch_cloudflare_ranges() { [[ "$__TEST_FETCH" == ok ]] || return 1; CF_V4_RANGES="173.245.48.0/20"; CF_V6_RANGES="2400:cb00::/32"; }
+    applied_cloudflare_rules() { printf '%s' "$__TEST_APPLIED"; }
+    detect_open_ports() { printf '%s' "$__TEST_PORTS"; }
+    setup_ufw() { echo "setup_ufw with ports: $OPEN_PORTS"; }
+    run_refresh_cloudflare
+  ) 2>&1
+}
+__TEST_FETCH=ok; __TEST_PORTS="80 443"
+__TEST_APPLIED="$(printf '443 173.245.48.0/20\n443 2400:cb00::/32\n80 173.245.48.0/20\n80 2400:cb00::/32')"
+assert_no_match "leaves UFW alone when the list is the same" "setup_ufw" "$(refresh_case)"
+__TEST_APPLIED="$(printf '443 173.245.48.0/20\n80 173.245.48.0/20\n80 2400:cb00::/32')"
+assert_match "applies UFW again, on the same ports, when a range is missing on one port" "setup_ufw with ports: 80 443" "$(refresh_case)"
+__TEST_APPLIED="$(printf '443 173.245.48.0/20\n80 173.245.48.0/20')"
+assert_match "applies UFW again when Cloudflare added a range" "setup_ufw with ports: 80 443" "$(refresh_case)"
+__TEST_FETCH=fail
+assert_no_match "leaves UFW alone when the fetch fails" "setup_ufw" "$(refresh_case)"
+__TEST_FETCH=ok; __TEST_PORTS=""
+assert_no_match "never builds a firewall on a box that has no Cloudflare rules" "setup_ufw" "$(refresh_case)"
+unset -f refresh_case
+
 # --- Tailscale IP validation (bind_ssh_to_tailscale's CGNAT regex) --------
 echo "Tailscale CGNAT IP regex"
 ts_re='^100\.([6-9][4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}$'
